@@ -21,7 +21,7 @@ class Vocab(object):
                 idx = len(self._word2idx)
                 self._word2idx[token] = idx
             with open(vocab_file, "r", encoding="utf-8") as f:
-                count = 0
+                count = len(special_tokens)
                 for line in f:
                     word, freq = line.split("\t")
                     if word not in self._word2idx:
@@ -87,7 +87,7 @@ def load_data(input_file, vocab, debug=False):
         answerable = []
         for i, line in enumerate(f):
             # debug mode
-            if debug and i == 20:
+            if debug and i == 2:
                 break
             # question / context / start_idx / end_idx / oracle_sentence_idx / answerable
             contents = line.split("\t")
