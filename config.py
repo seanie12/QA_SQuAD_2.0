@@ -7,4 +7,5 @@ class Config(object):
         self.lstm_size = 128
         self.attention_size = 128
         self.clip = 5
+        self.alpha = 1e-1
 

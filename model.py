@@ -86,13 +86,21 @@ class SSNet(object):
             v = tf.get_variable(shape=[self.config.attention_size, 1],
                                 initializer=layers.xavier_initializer(),
                                 name="v")
-            # [b * s, w , d] -> [b * s * w ,1]
+            # [b * s, w , d] -> [b * s * w , d]
             reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
-
+            # [b * s * w, 1]
             attention_score = tf.matmul(reshaped_projected, v)
-            attention_weight = tf.nn.softmax(attention_score, 1)
             # reshape to original shape [b*s*w, 1] -> [b*s, w, 1]
-            attention_weight = tf.reshape(attention_weight, [-1, self.word_size, 1])
+            attention_score = tf.reshape(attention_score, [-1, self.word_size, 1])
+
+            # -inf weight to zero padding
+            sequence_length = tf.reshape(self.sequence_lengths, [-1])
+            mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
+            mask = tf.expand_dims(mask, axis=2)
+            padding = tf.ones_like(attention_score) * (-2 ** 32 + 1)
+            attention_score = tf.where(tf.equal(mask, 0), padding, attention_score)
+
+            attention_weight = tf.nn.softmax(attention_score, 1)
             sentence_vector = tf.reduce_sum(self.sentence_lstm * attention_weight, axis=1)
             self.sentence_vectors = tf.reshape(sentence_vector,
                                                [self.document_size, self.sentence_size,
@@ -100,11 +108,14 @@ class SSNet(object):
 
     def auxiliary_loss(self, attention_score, document_vector):
         # [b * s ,1] -> [b, s]
-        attention_logits = tf.reshape(attention_score, [self.document_size, self.sentence_size])
+        attention_logits = tf.squeeze(attention_score, axis=-1)
         attention_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=attention_logits,
                                                                         labels=self.sentence_idx)
         attention_loss = tf.reduce_mean(attention_loss)
         binary_logits = layers.fully_connected(document_vector, 2, activation_fn=None)
+        self.preds = tf.argmax(binary_logits, axis=1, output_type=tf.int32)
+        correct_pred = tf.equal(self.preds, self.answerable)
+        self.acc = tf.reduce_mean(tf.cast(correct_pred, dtype=tf.float32))
         logistic_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=binary_logits,
                                                                        labels=self.answerable)
         logistic_loss = tf.reduce_mean(logistic_loss)
@@ -125,15 +136,21 @@ class SSNet(object):
             # [b ,s, d] -> [b * s, d]
             reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
             v = tf.get_variable(shape=[self.config.attention_size, 1], name="v")
-
             attention_score = tf.matmul(reshaped_projected, v)
-            attention_weight = tf.nn.softmax(attention_score, 1)
             # [b * s, 1] -> [b, s, 1]
-            attention_weight = tf.reshape(attention_weight, [-1, self.sentence_size, 1])
+            attention_score = tf.reshape(attention_score, [-1, self.sentence_size, 1])
+
+            # -inf score for zero padding
+            mask = tf.sequence_mask(self.sentence_lengths, dtype=tf.float32)
+            mask = tf.expand_dims(mask, axis=2)
+            padding = tf.ones_like(attention_score) * (-2 ** 32 + 1)
+            attention_score = tf.where(tf.equal(mask, 0), padding, attention_score)
+
+            attention_weight = tf.nn.softmax(attention_score, 1)
             self.document_vector = tf.reduce_sum(document_lstm * attention_weight, axis=1)
             self.attention_loss, self.logistic_loss = self.auxiliary_loss(attention_score,
                                                                           self.document_vector)
-            self.loss = self.attention_loss + self.logistic_loss
+            self.loss = self.config.alpha * self.attention_loss + self.logistic_loss
 
     def add_train_op(self):
         with tf.variable_scope("adam_opt"):
@@ -162,7 +179,8 @@ class SSNet(object):
             self.sentence_idx: sentence_idx,
             self.answerable: answerable
         }
-        output_feed = [self.train_op, self.loss]
-        _, loss = self.sess.run(output_feed, feed_dict)
-        return loss
-    # TODO : implement QA module, debug sentence selector, add optimizer
+        output_feed = [self.train_op, self.loss, self.acc, self.preds]
+        _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
+        return loss, acc, pred
+
+    # TODO : implement QA module, add attention mask for zero padding
