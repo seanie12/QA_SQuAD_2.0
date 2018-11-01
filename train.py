@@ -18,12 +18,15 @@ ssnet = SSNet(config)
 ssnet.build_model()
 for i in range(200):
     batches = batch_loader(train_data, batch_size, shuffle=True)
-    for batch in batches:
+    for j,batch in enumerate(batches):
         batch_q, batch_s, batch_s_idx, batch_ans = zip(*batch)
         question_length, padded_q = zero_padding(batch_q, level=1)
         sequence_length, sentence_length, padded_s = zero_padding(batch_s, level=2)
         loss, acc, pred = ssnet.train(padded_q, question_length, padded_s,
                                       sequence_length, sentence_length,
                                       batch_s_idx, batch_ans)
+        print(j)
+        print(np.bincount(batch_ans))
         print(np.bincount(pred))
         print(loss, acc)
+        print("------------------")

@@ -1,14 +1,18 @@
 import tensorflow as tf
 from tensorflow.contrib import layers
+import math
 
 
-class SSNet(object):
+class SSQANet(object):
     def __init__(self, config):
         self.config = config
         self.sess = None
         self.saver = None
+        self.regularizer = layers.l2_regularizer(self.config.l2_lambda)
 
     def add_placeholder(self):
+        self.contexts = tf.placeholder(shape=[None, None], dtype=tf.int32)
+        self.context_legnth = tf.placeholder(shape=[None], dtype=tf.int32)
         self.questions = tf.placeholder(shape=[None, None], dtype=tf.int32)
         self.question_legnths = tf.placeholder(shape=[None], dtype=tf.int32)
         # [batch, num_words]
@@ -36,11 +40,99 @@ class SSNet(object):
         self.init_session()
 
     def add_embeddings(self):
-        self.embedding_matrix = tf.get_variable(shape=[self.config.vocab_size, self.config.embedding_size],
-                                                initializer=layers.xavier_initializer(), name="embedding")
-        self.embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
+        # share word embedding matrix
+        zeros = tf.constant([[0.0] * self.config.embedding_size])
+        embedding_matrix = tf.get_variable(shape=[self.config.vocab_size - 1, self.config.embedding_size],
+                                           initializer=layers.xavier_initializer(), name="embedding")
+
+        self.embedding_matrix = tf.concat([zeros, embedding_matrix], axis=0)
         self.embedded_words = tf.nn.embedding_lookup(self.embedding_matrix, self.input_words)
         self.embedded_sentences = tf.nn.embedding_lookup(self.embedding_matrix, self.sentences)
+        embedded_context = tf.nn.embedding_lookup(self.embedding_matrix, self.contexts)
+        self.embedded_context = embedded_context \
+                                + self.position_embeddings(embedded_context, self.context_legnth)
+        embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
+        self.embedded_questions = embedded_questions \
+                                  + self.position_embeddings(embedded_questions, self.question_legnths)
+
+    @staticmethod
+    def position_embeddings(inputs, sequence_length):
+        length = tf.shape(inputs)[1]
+        channels = tf.shape(inputs)[2]
+        max_timescale = 1.0e4
+        min_timescale = 1.0
+        position = tf.cast(tf.range(length), tf.float32)
+        num_timescales = channels // 2
+        log_timescale_increment = (
+                math.log(float(max_timescale) / float(min_timescale)) /
+                (tf.to_float(num_timescales) - 1))
+        inv_timescales = min_timescale * tf.exp(
+            tf.to_float(tf.range(num_timescales)) * -log_timescale_increment)
+        scaled_time = tf.expand_dims(position, 1) * tf.expand_dims(inv_timescales, 0)
+        signal = tf.concat([tf.sin(scaled_time), tf.cos(scaled_time)], axis=1)
+        signal = tf.pad(signal, [[0, 0], [0, tf.mod(channels, 2)]])
+        signal = tf.reshape(signal, [1, length, channels])
+        # mask for zero padding
+        mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
+        mask = tf.expand_dims(mask, axis=2)
+        signal *= mask
+        return signal
+
+    def layer_dropout(self, inputs, residual, dropout):
+        cond = tf.random_uniform([]) < dropout
+        return tf.cond(cond, lambda: residual, lambda: tf.nn.dropout(inputs, self.dropout) + residual)
+
+    def self_attention_block(self, inputs, sequence_length, sublayers, scope, reuse):
+        with tf.variable_scope(scope, reuse=reuse):
+            l, L = sublayers
+            inputs = layers.layer_norm(inputs)
+            inputs = tf.nn.dropout(inputs, self.dropout)
+            outputs = self.multihead_attention(inputs, sequence_length)
+            outputs = self.layer_dropout(outputs, inputs, (1 - self.dropout) * l / float(L))
+            l += 1
+            # FFN
+            residual = layers.layer_norm(outputs)
+            outputs = tf.nn.dropout(outputs, self.dropout)
+            hiddens = tf.layers.dense(outputs, self.config.attention_size * 2,
+                                      activation=tf.nn.elu)
+            fc_outputs = tf.layers.dense(hiddens, self.config.attention_size,
+                                         activation=None)
+            outputs = self.layer_dropout(residual, fc_outputs, (1 - self.dropout) * l / float(L))
+
+        return outputs
+
+    def multihead_attention(self, queries, sequence_length):
+        Q = tf.layers.dense(queries, self.config.projection_szie,
+                            activation=tf.nn.elu, kernel_regularizer=self.regularizer)
+        K = tf.layers.dense(queries, self.config.projection_szie,
+                            activation=tf.nn.elu, kernel_regularizer=self.regularizer)
+        V = tf.layers.dense(queries, self.config.projection_szie,
+                            activation=tf.nn.elu, kernel_regularizer=self.regularizer)
+        Q_ = tf.concat(tf.split(Q, self.config.num_heads, axis=2), axis=0)
+        K_ = tf.concat(tf.split(K, self.config.num_heads, axis=2), axis=0)
+        V_ = tf.concat(tf.split(V, self.config.num_heads, axis=2), axis=0)
+        # attention weight and scaling
+        weight = tf.matmul(Q_, tf.transpose(K_, [0, 2, 1]))
+        weight /= (self.config.projection_szie // self.config.num_heads) ** 0.5
+        # key masking : assign -inf to zero padding
+        key_mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
+        key_mask = tf.tile(key_mask, [self.config.num_heads, 1])
+        key_mask = tf.tile(tf.expand_dims(key_mask, axis=1), [1, tf.shape(queries)[1]], 1)
+
+        paddings = tf.ones_like(weight) * (-2 ** 32 + 1)
+        weight = tf.where(tf.equal(key_mask, 0), paddings, weight)
+        weight = tf.nn.softmax(weight)
+
+        # query masking - assign zero to where query is zero padding token
+        query_mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
+        query_mask = tf.tile(query_mask, [self.config.num_heads, 1])
+        query_mask = tf.expand_dims(query_mask, axis=2)
+        weight *= query_mask
+        weight = tf.nn.dropout(weight, self.dropout)
+        outputs = tf.matmul(weight, V_)
+        outputs = tf.concat(tf.split(outputs, self.config.num_heads, axis=0), axis=2)
+
+        return outputs
 
     def bi_lstm_embedding(self, inputs, sequence_length, scope, reuse, return_last=False):
         with tf.variable_scope(scope, reuse=reuse):

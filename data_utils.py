@@ -87,7 +87,7 @@ def load_data(input_file, vocab, debug=False):
         answerable = []
         for i, line in enumerate(f):
             # debug mode
-            if debug and i == 2:
+            if debug and i == 100:
                 break
             # question / context / start_idx / end_idx / oracle_sentence_idx / answerable
             contents = line.split("\t")
