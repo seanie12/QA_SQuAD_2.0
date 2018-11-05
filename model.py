@@ -48,12 +48,8 @@ class SSQANet(object):
         self.embedding_matrix = tf.concat([zeros, embedding_matrix], axis=0)
         self.embedded_words = tf.nn.embedding_lookup(self.embedding_matrix, self.input_words)
         self.embedded_sentences = tf.nn.embedding_lookup(self.embedding_matrix, self.sentences)
-        embedded_context = tf.nn.embedding_lookup(self.embedding_matrix, self.contexts)
-        self.embedded_context = embedded_context \
-                                + self.position_embeddings(embedded_context, self.context_legnth)
-        embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
-        self.embedded_questions = embedded_questions \
-                                  + self.position_embeddings(embedded_questions, self.question_legnths)
+        self.embedded_context = tf.nn.embedding_lookup(self.embedding_matrix, self.contexts)
+        self.embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
 
     @staticmethod
     def position_embeddings(inputs, sequence_length):
@@ -82,6 +78,55 @@ class SSQANet(object):
         cond = tf.random_uniform([]) < dropout
         return tf.cond(cond, lambda: residual, lambda: tf.nn.dropout(inputs, self.dropout) + residual)
 
+    def residual_block(self, inputs, sequence_length, num_blocks, num_conv_blocks, kernel_size, num_filters, scope,
+                       reuse):
+        with tf.variable_scope(scope, reuse=reuse):
+            sublayer = 1
+            # conv_block * # + self attetion + feed forward
+            total_sublayers = (num_conv_blocks + 2) * num_blocks
+            for i in range(num_blocks):
+                # add positional embedding
+                inputs = inputs + self.position_embeddings(inputs, sequence_length)
+                outputs, sublayer = self.conv_blocks(inputs, num_conv_blocks, kernel_size, num_filters,
+                                                     scope="conv_block_{}".format(i), reuse=reuse,
+                                                     sublayers=(sublayer, total_sublayers))
+                outputs, sublayer = self.self_attention_block(outputs, sequence_length, (sublayer, total_sublayers),
+                                                              scope="attention_block_{}".format(i), reuse=reuse)
+            return outputs
+
+    def conv_blocks(self, inputs, num_conv_blocks, kernel_size,
+                    num_filters, scope, reuse, sublayers=(1, 1)):
+        with tf.variable_scope(scope, reuse=reuse):
+            l, L = sublayers
+            outputs = None
+            for i in range(num_conv_blocks):
+                residual = inputs
+                # apply layer normalization
+                normalized = layers.layer_norm(inputs)
+                if i % 2 == 0:
+                    # apply dropout
+                    normalized = tf.nn.dropout(normalized, self.dropout)
+                outputs = self.depthwise_separable_conv(normalized, kernel_size, num_filters, scope, reuse)
+                outputs = self.layer_dropout(outputs, residual, self.dropout)
+            return outputs, l
+
+    def depthwise_separable_conv(self, inputs, kernel_size, num_filters, scope, reuse):
+        with tf.variable_scope(scope, reuse=reuse):
+            # [batch, t, 1, d]
+            inputs = tf.expand_dims(inputs, axis=2)
+            dims = tf.shape(inputs)
+            depthwise_filter = tf.get_variable(shape=[kernel_size, 1, dims[-1], 1],
+                                               name="depthwise_filter", regularizer=self.regularizer)
+            pointwise_filter = tf.get_variable(shape=[1, 1, dims[-1], num_filters], name="pointwise_filter",
+                                               regularizer=self.regularizer)
+            bias = tf.get_variable(initializer=tf.zeros_initializer(), name="bias", shape=[num_filters])
+            outputs = tf.nn.separable_conv2d(inputs, depthwise_filter, pointwise_filter,
+                                             strides=(1, 1, 1, 1), padding="SAME")
+            outputs = tf.nn.relu(outputs + bias)
+            # recover to the original shape [b, t, d]
+            outputs = tf.squeeze(outputs, axis=2)
+            return outputs
+
     def self_attention_block(self, inputs, sequence_length, sublayers, scope, reuse):
         with tf.variable_scope(scope, reuse=reuse):
             l, L = sublayers
@@ -99,7 +144,7 @@ class SSQANet(object):
                                          activation=None)
             outputs = self.layer_dropout(residual, fc_outputs, (1 - self.dropout) * l / float(L))
 
-        return outputs
+        return outputs, l
 
     def multihead_attention(self, queries, sequence_length):
         Q = tf.layers.dense(queries, self.config.projection_szie,
@@ -275,4 +320,4 @@ class SSQANet(object):
         _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
         return loss, acc, pred
 
-    # TODO : implement QA module, add attention mask for zero padding
+    # TODO : implement QA module
