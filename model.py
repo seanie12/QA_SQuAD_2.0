@@ -12,9 +12,10 @@ class SSQANet(object):
         self.init = lambda: layers.xavier_initializer()
         self.relu_init = lambda: layers.variance_scaling_initializer()
 
-    def add_placeholder(self):
+    def build_model(self):
+        # add place holder
         self.contexts = tf.placeholder(shape=[None, None], dtype=tf.int32)
-        self.context_legnth = tf.placeholder(shape=[None], dtype=tf.int32)
+        self.context_legnths = tf.placeholder(shape=[None], dtype=tf.int32)
         self.questions = tf.placeholder(shape=[None, None], dtype=tf.int32)
         self.question_legnths = tf.placeholder(shape=[None], dtype=tf.int32)
         # [batch, num_words]
@@ -31,18 +32,7 @@ class SSQANet(object):
         self.dropout = tf.placeholder(dtype=tf.float32)
 
         self.document_size, self.sentence_size, self.word_size = tf.unstack(tf.shape(self.sentences))
-
-    def build_model(self):
-        self.add_placeholder()
-        self.add_embeddings()
-        self.add_word_lstm()
-        self.add_word_attention()
-        self.add_sentence_attention()
-        self.add_train_op()
-        self.init_session()
-
-    def add_embeddings(self):
-        # share word embedding matrix
+        # add embeddings
         zeros = tf.constant([[0.0] * self.config.embedding_size])
         embedding_matrix = tf.get_variable(shape=[self.config.vocab_size - 1, self.config.embedding_size],
                                            initializer=layers.xavier_initializer(), name="embedding")
@@ -52,6 +42,77 @@ class SSQANet(object):
         self.embedded_sentences = tf.nn.embedding_lookup(self.embedding_matrix, self.sentences)
         self.embedded_context = tf.nn.embedding_lookup(self.embedding_matrix, self.contexts)
         self.embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
+
+        # conv block and self attention block
+        with tf.varaible_scope("Embedding_Encoder_Layer"):
+            contexts = self.residual_block(self.embedded_context, self.context_legnths,
+                                           num_blocks=1, num_conv_blocks=4, kernel_size=7,
+                                           num_filters=128, scope="Embedding_Encoder", reuse=False)
+            questions = self.residual_block(self.embedded_questions, self.question_legnths, num_blocks=1,
+                                            num_conv_blocks=4, kernel_size=7, num_filters=128,
+                                            scope="Embedding_Encoder", reuse=True)
+
+        with tf.variable_scope("hierarchical_attention"):
+            reshaped_sentences = tf.reshape(self.embedded_sentences,
+                                            [-1, self.word_size, self.config.embedding_size])
+            sentence_lengths = tf.reshape(self.sequence_lengths, [-1])
+            sentence_lstm = self.bi_lstm_embedding(reshaped_sentences, sentence_lengths,
+                                                   scope="word_encoder", reuse=False)
+            encoded_question = self.question_encoding(questions, self.question_legnths)
+            sentence_vectors = self.word_level_attention(encoded_question, sentence_lstm, self.document_size,
+                                                         self.sentence_size, self.word_size, self.sequence_lengths)
+            document_vector, sentence_score = self.sentence_level_attention(encoded_question, sentence_vectors,
+                                                                            self.sentence_size, self.sentence_lengths)
+
+            self.attention_loss, self.binary_loss = self.auxiliary_loss(sentence_score, document_vector)
+        with tf.variable_scope("Context_Query_Attention_Layer"):
+            A, B = self.co_attention(questions, contexts, document_vector,
+                                     self.question_legnths, self.context_legnths)
+            attention_outputs = [contexts, A, contexts * A, contexts * B]
+        with tf.variable_scope("Model_Encoder_Layer"):
+            inputs = tf.concat(attention_outputs, axis=2)
+            inputs = tf.layers.dense(inputs, self.config.embedding_size,
+                                     kernel_regularizer=self.regularizer,
+                                     kernel_initializer=self.relu_init,
+                                     activation=tf.nn.relu)
+            memories = []
+            for i in range(3):
+                outputs = self.residual_block(inputs, self.context_legnths,
+                                              num_blocks=7, num_conv_blocks=2,
+                                              num_filters=128, kernel_size=5,
+                                              scope="Model_Encoder",
+                                              reuse=True if i > 0 else False)
+                if i == 2:
+                    outputs = tf.nn.dropout(outputs, self.dropout)
+                memories.append(outputs)
+                inputs = outputs
+        with tf.variable_scope("Output_Layer"):
+            logits_inputs = tf.concat([memories[0], memories[1]], axis=2)
+            start_logits = tf.layers.dense(logits_inputs, 1, activation=None,
+                                           kernel_initializer=self.init,
+                                           kernel_regularizer=self.regularizer)
+            start_logits = tf.squeeze(start_logits, axis=-1)
+            logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
+            end_logits = tf.layers.dense(logits_inputs, 1, activation=None,
+                                         kernel_initializer=self.init,
+                                         kernel_regularizer=self.regularizer)
+            end_logits = tf.squeeze(end_logits, axis=-1)
+            start_label, end_label = tf.split(self.answer_span, 2, axis=1)
+        self.add_train_op()
+        self.init_session()
+
+    def question_encoding(self, inputs, sequence_lengths):
+        # [b, m, d] -> [b, m, 1]
+        alpha = tf.layers.dense(inputs, 1, activation=None, use_bias=False,
+                                kernel_initializer=self.init,
+                                kernel_regularizer=self.regularizer)
+        mask = tf.sequence_mask(sequence_lengths, dtype=tf.float32)
+        mask = tf.expand_dims(mask, axis=2)
+        paddings = tf.ones_like(alpha) * (-2 ** 32 + 1)
+        alpha = tf.where(tf.equal(mask, 0), paddings, alpha)
+        alpha = tf.nn.softmax(alpha, 1)
+        encoding = tf.reduce_sum(alpha * inputs, axis=1)
+        return encoding
 
     @staticmethod
     def position_embeddings(inputs, sequence_length):
@@ -80,8 +141,8 @@ class SSQANet(object):
         cond = tf.random_uniform([]) < dropout
         return tf.cond(cond, lambda: residual, lambda: tf.nn.dropout(inputs, self.dropout) + residual)
 
-    def residual_block(self, inputs, sequence_length, num_blocks, num_conv_blocks, kernel_size, num_filters, scope,
-                       reuse):
+    def residual_block(self, inputs, sequence_length, num_blocks, num_conv_blocks,
+                       kernel_size, num_filters, scope, reuse):
         with tf.variable_scope(scope, reuse=reuse):
             sublayer = 1
             # conv_block * # + self attetion + feed forward
@@ -200,13 +261,13 @@ class SSQANet(object):
         score = tf.squeeze(score, axis=-1)
         return score
 
-    def co_attention(self, questions, contexts, questions_lengths, contexts_lengths):
+    def co_attention(self, questions, contexts, document_vector, questions_lengths, contexts_lengths):
         # context to query attention
         # Q :[b, m, d], C :[b, n, d]
         # S : [b, n, m]
         n = tf.shape(contexts)[1]
         m = tf.shape(questions)[1]
-        attention_score = self.quadlinear_attention(questions, contexts)
+        attention_score = self.quadlinear_attention(questions, contexts, document_vector)
         S = attention_score
         # key masking : [b, m]
         key_masks = tf.sequence_mask(questions_lengths, dtype=tf.float32)
@@ -253,55 +314,44 @@ class SSQANet(object):
             else:
                 return outputs
 
-    def add_word_lstm(self):
-        with tf.variable_scope("bi-lstm-word") as scope:
-            # [b * s, w, d]
-            reshaped_sentences = tf.reshape(self.embedded_sentences,
-                                            [-1, self.word_size, self.config.embedding_size])
-            sentence_lengths = tf.reshape(self.sequence_lengths, [-1])
-            self.sentence_lstm = self.bi_lstm_embedding(reshaped_sentences, sentence_lengths,
-                                                        scope, reuse=False)
-
-            # get last hidden states and concatenate bi-directional hidden states
-            # [batch, d * 2]
-            self.question_lstm = self.bi_lstm_embedding(self.embedded_questions,
-                                                        self.question_legnths,
-                                                        scope, reuse=True,
-                                                        return_last=True)
-
-    def add_word_attention(self):
+    def word_level_attention(self, question_lstm, sentence_lstm, document_size,
+                             sentence_size, word_size, sequence_lengths):
         # attend each sentence given the question
         # [b, 1, d * 2 ] -> [b * s, w, d * 2]
         with tf.variable_scope("word_attention"):
-            query = tf.tile(tf.expand_dims(self.question_lstm, axis=1),
-                            [self.sentence_size, self.word_size, 1])
-            attention_input = tf.concat([query, self.sentence_lstm], axis=2)
+            query = tf.tile(tf.expand_dims(question_lstm, axis=1),
+                            [sentence_size, word_size, 1])
+            attention_input = tf.concat([query, sentence_lstm], axis=2)
             # [b * s, w, attention_size]
             projected = layers.fully_connected(attention_input,
                                                self.config.attention_size,
+                                               weights_initializer=self.init,
+                                               weights_regularizer=self.regularizer,
                                                activation_fn=tf.nn.elu)
             v = tf.get_variable(shape=[self.config.attention_size, 1],
-                                initializer=layers.xavier_initializer(),
+                                initializer=self.init,
+                                regularizer=self.regularizer,
                                 name="v")
             # [b * s, w , d] -> [b * s * w , d]
             reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
             # [b * s * w, 1]
             attention_score = tf.matmul(reshaped_projected, v)
             # reshape to original shape [b*s*w, 1] -> [b*s, w, 1]
-            attention_score = tf.reshape(attention_score, [-1, self.word_size, 1])
+            attention_score = tf.reshape(attention_score, [-1, word_size, 1])
 
             # -inf weight to zero padding
-            sequence_length = tf.reshape(self.sequence_lengths, [-1])
+            sequence_length = tf.reshape(sequence_lengths, [-1])
             mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
             mask = tf.expand_dims(mask, axis=2)
             padding = tf.ones_like(attention_score) * (-2 ** 32 + 1)
             attention_score = tf.where(tf.equal(mask, 0), padding, attention_score)
 
             attention_weight = tf.nn.softmax(attention_score, 1)
-            sentence_vector = tf.reduce_sum(self.sentence_lstm * attention_weight, axis=1)
-            self.sentence_vectors = tf.reshape(sentence_vector,
-                                               [self.document_size, self.sentence_size,
-                                                self.config.lstm_size * 2])
+            sentence_vector = tf.reduce_sum(sentence_lstm * attention_weight, axis=1)
+            sentence_vectors = tf.reshape(sentence_vector,
+                                          [document_size, sentence_size,
+                                           self.config.lstm_size * 2])
+            return sentence_vectors
 
     def auxiliary_loss(self, attention_score, document_vector):
         # [b * s ,1] -> [b, s]
@@ -319,35 +369,38 @@ class SSQANet(object):
 
         return attention_loss, logistic_loss
 
-    def add_sentence_attention(self):
+    def sentence_level_attention(self, question_lstm, sentence_vectors, sentence_size, sentence_lengths):
         with tf.variable_scope("sentence_attention") as scope:
-            query = tf.tile(tf.expand_dims(self.question_lstm, 1), [1, self.sentence_size, 1])
+            query = tf.tile(tf.expand_dims(question_lstm, 1), [1, self.sentence_size, 1])
             # [b, s, 2 * d]
-            document_lstm = self.bi_lstm_embedding(self.sentence_vectors,
-                                                   self.sentence_lengths,
+            document_lstm = self.bi_lstm_embedding(sentence_vectors,
+                                                   sentence_lengths,
                                                    scope, reuse=False)
             attention_input = tf.concat([query, document_lstm], axis=2)
             projected = layers.fully_connected(attention_input,
                                                self.config.attention_size,
+                                               weights_initializer=self.init,
+                                               weights_regularizer=self.regularizer,
                                                activation_fn=tf.nn.elu)
             # [b ,s, d] -> [b * s, d]
             reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
-            v = tf.get_variable(shape=[self.config.attention_size, 1], name="v")
+            v = tf.get_variable(shape=[self.config.attention_size, 1], name="v", regularizer=self.regularizer)
             attention_score = tf.matmul(reshaped_projected, v)
             # [b * s, 1] -> [b, s, 1]
-            attention_score = tf.reshape(attention_score, [-1, self.sentence_size, 1])
+            attention_score = tf.reshape(attention_score, [-1, sentence_size, 1])
 
             # -inf score for zero padding
-            mask = tf.sequence_mask(self.sentence_lengths, dtype=tf.float32)
+            mask = tf.sequence_mask(sentence_lengths, dtype=tf.float32)
             mask = tf.expand_dims(mask, axis=2)
             padding = tf.ones_like(attention_score) * (-2 ** 32 + 1)
             attention_score = tf.where(tf.equal(mask, 0), padding, attention_score)
 
             attention_weight = tf.nn.softmax(attention_score, 1)
-            self.document_vector = tf.reduce_sum(document_lstm * attention_weight, axis=1)
-            self.attention_loss, self.logistic_loss = self.auxiliary_loss(attention_score,
-                                                                          self.document_vector)
-            self.loss = self.config.alpha * self.attention_loss + self.logistic_loss
+            document_vector = tf.reduce_sum(document_lstm * attention_weight, axis=1)
+            return document_vector, attention_score
+            # self.attention_loss, self.logistic_loss = self.auxiliary_loss(attention_score,
+            #                                                               self.document_vector)
+            # self.loss = self.config.alpha * self.attention_loss + self.logistic_loss
 
     def add_train_op(self):
         with tf.variable_scope("adam_opt"):
@@ -379,4 +432,3 @@ class SSQANet(object):
         output_feed = [self.train_op, self.loss, self.acc, self.preds]
         _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
         return loss, acc, pred
-
