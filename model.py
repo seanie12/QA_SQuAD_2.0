@@ -9,8 +9,6 @@ class SSQANet(object):
         self.sess = None
         self.saver = None
         self.regularizer = layers.l2_regularizer(self.config.l2_lambda)
-        self.init = lambda: layers.xavier_initializer()
-        self.relu_init = lambda: layers.variance_scaling_initializer()
         self.global_step = tf.Variable(0, trainable=False, name="global_step")
 
     def build_model(self):
@@ -30,7 +28,7 @@ class SSQANet(object):
         self.sentence_idx = tf.placeholder(shape=[None], dtype=tf.int32)
         self.answerable = tf.placeholder(shape=[None], dtype=tf.int32)
         self.answer_span = tf.placeholder(shape=[None, 2], dtype=tf.int32)
-        self.dropout = tf.placeholder(dtype=tf.float32)
+        self.dropout = tf.placeholder(dtype=tf.float32, name="dropout")
 
         self.document_size, self.sentence_size, self.word_size = tf.unstack(tf.shape(self.sentences))
         # add embeddings
@@ -45,7 +43,7 @@ class SSQANet(object):
         self.embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
 
         # conv block and self attention block
-        with tf.varaible_scope("Embedding_Encoder_Layer"):
+        with tf.variable_scope("Embedding_Encoder_Layer"):
             contexts = self.residual_block(self.embedded_context, self.context_legnths,
                                            num_blocks=1, num_conv_blocks=4, kernel_size=7,
                                            num_filters=128, scope="Embedding_Encoder", reuse=False)
@@ -74,7 +72,7 @@ class SSQANet(object):
             inputs = tf.concat(attention_outputs, axis=2)
             inputs = tf.layers.dense(inputs, self.config.embedding_size,
                                      kernel_regularizer=self.regularizer,
-                                     kernel_initializer=self.relu_init,
+                                     kernel_initializer=layers.variance_scaling_initializer(),
                                      activation=tf.nn.relu)
             memories = []
             for i in range(3):
@@ -87,22 +85,25 @@ class SSQANet(object):
                     outputs = tf.nn.dropout(outputs, self.dropout)
                 memories.append(outputs)
                 inputs = outputs
+
         with tf.variable_scope("Output_Layer"):
             logits_inputs = tf.concat([memories[0], memories[1]], axis=2)
             start_logits = tf.layers.dense(logits_inputs, 1, activation=None,
-                                           kernel_initializer=self.init,
+                                           kernel_initializer=layers.xavier_initializer(),
                                            kernel_regularizer=self.regularizer)
             start_logits = tf.squeeze(start_logits, axis=-1)
-            start_logits = self.mask_logits(start_logits)
+            start_logits = self.mask_logits(start_logits, self.context_legnths)
             logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
             end_logits = tf.layers.dense(logits_inputs, 1, activation=None,
-                                         kernel_initializer=self.init,
+                                         kernel_initializer=layers.xavier_initializer(),
                                          kernel_regularizer=self.regularizer)
             end_logits = tf.squeeze(end_logits, axis=-1)
-            end_logits = self.mask_logits(end_logits)
+            end_logits = self.mask_logits(end_logits, self.context_legnths)
             start_label, end_label = tf.split(self.answer_span, 2, axis=1)
+            start_label = tf.squeeze(start_label, axis=-1)
+            end_label = tf.squeeze(end_label, axis=-1)
             losses1 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=start_logits, labels=start_label)
-            losses2 = tf.nn.sparse_softmax_cross_entropy_with_logits(logtis=end_logits, labels=end_label)
+            losses2 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=end_logits, labels=end_label)
             self.cross_entropy_loss = tf.reduce_sum(losses1 + losses2)
             self.loss = self.cross_entropy_loss \
                         + self.config.alpha * self.attention_loss \
@@ -135,7 +136,7 @@ class SSQANet(object):
     def question_encoding(self, inputs, sequence_lengths):
         # [b, m, d] -> [b, m, 1]
         alpha = tf.layers.dense(inputs, 1, activation=None, use_bias=False,
-                                kernel_initializer=self.init,
+                                kernel_initializer=layers.variance_scaling_initializer(),
                                 kernel_regularizer=self.regularizer)
         mask = tf.sequence_mask(sequence_lengths, dtype=tf.float32)
         mask = tf.expand_dims(mask, axis=2)
@@ -178,6 +179,11 @@ class SSQANet(object):
             sublayer = 1
             # conv_block * # + self attetion + feed forward
             total_sublayers = (num_conv_blocks + 2) * num_blocks
+            dim = inputs.shape[-1]
+            if dim != num_filters:
+                inputs = tf.layers.dense(inputs, num_filters, activation=tf.nn.relu,
+                                         kernel_regularizer=self.regularizer,
+                                         kernel_initializer=layers.variance_scaling_initializer())
             for i in range(num_blocks):
                 # add positional embedding
                 inputs = inputs + self.position_embeddings(inputs, sequence_length)
@@ -186,6 +192,7 @@ class SSQANet(object):
                                                      sublayers=(sublayer, total_sublayers))
                 outputs, sublayer = self.self_attention_block(outputs, sequence_length, (sublayer, total_sublayers),
                                                               scope="attention_block_{}".format(i), reuse=reuse)
+                inputs = outputs
             return outputs
 
     def conv_blocks(self, inputs, num_conv_blocks, kernel_size,
@@ -193,6 +200,7 @@ class SSQANet(object):
         with tf.variable_scope(scope, reuse=reuse):
             l, L = sublayers
             outputs = None
+
             for i in range(num_conv_blocks):
                 residual = inputs
                 # apply layer normalization
@@ -200,7 +208,8 @@ class SSQANet(object):
                 if i % 2 == 0:
                     # apply dropout
                     normalized = tf.nn.dropout(normalized, self.dropout)
-                outputs = self.depthwise_separable_conv(normalized, kernel_size, num_filters, scope, reuse)
+                outputs = self.depthwise_separable_conv(normalized, kernel_size, num_filters,
+                                                        scope="depthwise_conv_{}".format(i), reuse=reuse)
                 outputs = self.layer_dropout(outputs, residual, self.dropout)
             return outputs, l
 
@@ -208,13 +217,19 @@ class SSQANet(object):
         with tf.variable_scope(scope, reuse=reuse):
             # [batch, t, 1, d]
             inputs = tf.expand_dims(inputs, axis=2)
-            dims = tf.shape(inputs)
-            depthwise_filter = tf.get_variable(shape=[kernel_size, 1, dims[-1], 1], initializer=self.relu_init,
-                                               name="depthwise_filter", regularizer=self.regularizer)
-            pointwise_filter = tf.get_variable(shape=[1, 1, dims[-1], num_filters], name="pointwise_filter",
-                                               initializer=self.relu_init,
+            depthwise_filter = tf.get_variable(shape=[kernel_size, 1, num_filters, 1],
+                                               initializer=layers.variance_scaling_initializer(),
+                                               name="depthwise_filter",
                                                regularizer=self.regularizer)
-            bias = tf.get_variable(initializer=tf.zeros_initializer(), name="bias", shape=[num_filters])
+            pointwise_filter = tf.get_variable(shape=[1, 1, num_filters, num_filters],
+                                               name="pointwise_filter",
+                                               initializer=layers.variance_scaling_initializer(),
+                                               regularizer=self.regularizer)
+            bias = tf.get_variable(shape=[num_filters],
+                                   initializer=tf.zeros_initializer(),
+                                   name="bias",
+                                   regularizer=self.regularizer)
+
             outputs = tf.nn.separable_conv2d(inputs, depthwise_filter, pointwise_filter,
                                              strides=(1, 1, 1, 1), padding="SAME")
             outputs = tf.nn.relu(outputs + bias)
@@ -242,22 +257,26 @@ class SSQANet(object):
         return outputs, l
 
     def multihead_attention(self, queries, sequence_length):
-        Q = tf.layers.dense(queries, self.config.projection_szie, kernel_initializer=self.init,
-                            activation=tf.nn.elu, kernel_regularizer=self.regularizer)
-        K = tf.layers.dense(queries, self.config.projection_szie, kernel_initializer=self.init,
-                            activation=tf.nn.elu, kernel_regularizer=self.regularizer)
-        V = tf.layers.dense(queries, self.config.projection_szie, kernel_initializer=self.init,
-                            activation=tf.nn.elu, kernel_regularizer=self.regularizer)
+        Q = tf.layers.dense(queries, self.config.attention_size,
+                            kernel_initializer=layers.variance_scaling_initializer(),
+                            activation=tf.nn.relu, kernel_regularizer=self.regularizer)
+        K = tf.layers.dense(queries, self.config.attention_size,
+                            kernel_initializer=layers.variance_scaling_initializer(),
+                            activation=tf.nn.relu, kernel_regularizer=self.regularizer)
+        V = tf.layers.dense(queries, self.config.attention_size,
+                            kernel_initializer=layers.variance_scaling_initializer(),
+                            activation=tf.nn.relu, kernel_regularizer=self.regularizer)
+
         Q_ = tf.concat(tf.split(Q, self.config.num_heads, axis=2), axis=0)
         K_ = tf.concat(tf.split(K, self.config.num_heads, axis=2), axis=0)
         V_ = tf.concat(tf.split(V, self.config.num_heads, axis=2), axis=0)
         # attention weight and scaling
         weight = tf.matmul(Q_, tf.transpose(K_, [0, 2, 1]))
-        weight /= (self.config.projection_szie // self.config.num_heads) ** 0.5
+        weight /= (self.config.attention_size // self.config.num_heads) ** 0.5
         # key masking : assign -inf to zero padding
         key_mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
         key_mask = tf.tile(key_mask, [self.config.num_heads, 1])
-        key_mask = tf.tile(tf.expand_dims(key_mask, axis=1), [1, tf.shape(queries)[1]], 1)
+        key_mask = tf.tile(tf.expand_dims(key_mask, axis=1), [1, tf.shape(queries)[1], 1])
 
         paddings = tf.ones_like(weight) * (-2 ** 32 + 1)
         weight = tf.where(tf.equal(key_mask, 0), paddings, weight)
@@ -356,11 +375,11 @@ class SSQANet(object):
             # [b * s, w, attention_size]
             projected = layers.fully_connected(attention_input,
                                                self.config.attention_size,
-                                               weights_initializer=self.init,
+                                               weights_initializer=layers.variance_scaling_initializer(),
                                                weights_regularizer=self.regularizer,
                                                activation_fn=tf.nn.elu)
             v = tf.get_variable(shape=[self.config.attention_size, 1],
-                                initializer=self.init,
+                                initializer=layers.xavier_initializer(),
                                 regularizer=self.regularizer,
                                 name="v")
             # [b * s, w , d] -> [b * s * w , d]
@@ -410,7 +429,7 @@ class SSQANet(object):
             attention_input = tf.concat([query, document_lstm], axis=2)
             projected = layers.fully_connected(attention_input,
                                                self.config.attention_size,
-                                               weights_initializer=self.init,
+                                               weights_initializer=layers.xavier_initializer(),
                                                weights_regularizer=self.regularizer,
                                                activation_fn=tf.nn.elu)
             # [b ,s, d] -> [b * s, d]
@@ -436,12 +455,12 @@ class SSQANet(object):
     def add_train_op(self):
         with tf.variable_scope("adam_opt"):
             lr = tf.minimum(self.config.lr,
-                                 0.001 / tf.log(999.) * tf.log(tf.cast(self.global_step, tf.float32) + 1))
-            self.opt = tf.train.AdamOptimizer(learning_rate=lr, beta1=0.8, beta2=0.999, epsilon=1e-7)
+                            0.001 / tf.log(999.) * tf.log(tf.cast(self.global_step, tf.float32) + 1))
+            opt = tf.train.AdamOptimizer(learning_rate=lr, beta1=0.8, beta2=0.999, epsilon=1e-7)
             vars = tf.trainable_variables()
-            grads = self.opt.gradients(self.loss)
+            grads = tf.gradients(self.loss, vars)
             clipped_grads, _ = tf.clip_by_global_norm(grads, self.config.grad_clip)
-            self.train_op = self.opt.apply_gradients(
+            self.train_op = opt.apply_gradients(
                 zip(clipped_grads, vars), global_step=self.global_step)
 
     def init_session(self):
@@ -452,16 +471,20 @@ class SSQANet(object):
         self.sess.run(tf.global_variables_initializer())
         self.saver = tf.train.Saver()
 
-    def train(self, questions, question_length, sentences, sequence_length,
-              sentence_length, sentence_idx, answerable):
+    def train(self, questions, question_length, contexts, context_lengths, sentences, sequence_length,
+              sentence_length, sentence_idx, answerable, spans, dropout=1.0):
         feed_dict = {
+            self.questions: questions,
+            self.question_legnths: question_length,
+            self.contexts: contexts,
+            self.context_legnths: context_lengths,
             self.sentences: sentences,
             self.sentence_lengths: sentence_length,
             self.sequence_lengths: sequence_length,
-            self.questions: questions,
-            self.question_legnths: question_length,
             self.sentence_idx: sentence_idx,
-            self.answerable: answerable
+            self.answerable: answerable,
+            self.answer_span: spans,
+            self.dropout:dropout
         }
         output_feed = [self.train_op, self.loss, self.acc, self.preds]
         _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
