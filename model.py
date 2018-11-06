@@ -11,6 +11,7 @@ class SSQANet(object):
         self.regularizer = layers.l2_regularizer(self.config.l2_lambda)
         self.init = lambda: layers.xavier_initializer()
         self.relu_init = lambda: layers.variance_scaling_initializer()
+        self.global_step = tf.Variable(0, trainable=False, name="global_step")
 
     def build_model(self):
         # add place holder
@@ -92,14 +93,44 @@ class SSQANet(object):
                                            kernel_initializer=self.init,
                                            kernel_regularizer=self.regularizer)
             start_logits = tf.squeeze(start_logits, axis=-1)
+            start_logits = self.mask_logits(start_logits)
             logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
             end_logits = tf.layers.dense(logits_inputs, 1, activation=None,
                                          kernel_initializer=self.init,
                                          kernel_regularizer=self.regularizer)
             end_logits = tf.squeeze(end_logits, axis=-1)
+            end_logits = self.mask_logits(end_logits)
             start_label, end_label = tf.split(self.answer_span, 2, axis=1)
+            losses1 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=start_logits, labels=start_label)
+            losses2 = tf.nn.sparse_softmax_cross_entropy_with_logits(logtis=end_logits, labels=end_label)
+            self.cross_entropy_loss = tf.reduce_sum(losses1 + losses2)
+            self.loss = self.cross_entropy_loss \
+                        + self.config.alpha * self.attention_loss \
+                        + self.config.beta * self.binary_loss
+
+        if self.config.l2_lambda > 0:
+            vars = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+            l2_loss = layers.apply_regularization(self.regularizer, vars)
+            self.loss += l2_loss
+        # Exponential moving average
+        self.var_ema = tf.train.ExponentialMovingAverage(0.9999)
+        ema_op = self.var_ema.apply(tf.trainable_variables())
+        with tf.control_dependencies([ema_op]):
+            self.loss = tf.identity(self.loss)
+
+            self.assign_vars = []
+            for var in tf.global_variables():
+                v = self.var_ema.average(var)
+                if v:
+                    self.assign_vars.append(tf.assign(var, v))
+
         self.add_train_op()
         self.init_session()
+
+    def mask_logits(self, logits, sequence_lengths):
+        mask = tf.sequence_mask(sequence_lengths, dtype=tf.float32)
+        mask_value = -1e32
+        return logits + mask_value * (1 - mask)
 
     def question_encoding(self, inputs, sequence_lengths):
         # [b, m, d] -> [b, m, 1]
@@ -404,11 +435,14 @@ class SSQANet(object):
 
     def add_train_op(self):
         with tf.variable_scope("adam_opt"):
-            opt = tf.train.AdamOptimizer(self.config.lr)
+            lr = tf.minimum(self.config.lr,
+                                 0.001 / tf.log(999.) * tf.log(tf.cast(self.global_step, tf.float32) + 1))
+            self.opt = tf.train.AdamOptimizer(learning_rate=lr, beta1=0.8, beta2=0.999, epsilon=1e-7)
             vars = tf.trainable_variables()
-            grads = tf.gradients(self.loss, vars)
-            clipped_grads, _ = tf.clip_by_global_norm(grads, self.config.clip)
-            self.train_op = opt.apply_gradients(zip(clipped_grads, vars))
+            grads = self.opt.gradients(self.loss)
+            clipped_grads, _ = tf.clip_by_global_norm(grads, self.config.grad_clip)
+            self.train_op = self.opt.apply_gradients(
+                zip(clipped_grads, vars), global_step=self.global_step)
 
     def init_session(self):
         config = tf.ConfigProto(allow_soft_placement=True)
