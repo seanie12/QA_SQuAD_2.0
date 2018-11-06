@@ -9,6 +9,8 @@ class SSQANet(object):
         self.sess = None
         self.saver = None
         self.regularizer = layers.l2_regularizer(self.config.l2_lambda)
+        self.init = lambda: layers.xavier_initializer()
+        self.relu_init = lambda: layers.variance_scaling_initializer()
 
     def add_placeholder(self):
         self.contexts = tf.placeholder(shape=[None, None], dtype=tf.int32)
@@ -115,9 +117,10 @@ class SSQANet(object):
             # [batch, t, 1, d]
             inputs = tf.expand_dims(inputs, axis=2)
             dims = tf.shape(inputs)
-            depthwise_filter = tf.get_variable(shape=[kernel_size, 1, dims[-1], 1],
+            depthwise_filter = tf.get_variable(shape=[kernel_size, 1, dims[-1], 1], initializer=self.relu_init,
                                                name="depthwise_filter", regularizer=self.regularizer)
             pointwise_filter = tf.get_variable(shape=[1, 1, dims[-1], num_filters], name="pointwise_filter",
+                                               initializer=self.relu_init,
                                                regularizer=self.regularizer)
             bias = tf.get_variable(initializer=tf.zeros_initializer(), name="bias", shape=[num_filters])
             outputs = tf.nn.separable_conv2d(inputs, depthwise_filter, pointwise_filter,
@@ -147,11 +150,11 @@ class SSQANet(object):
         return outputs, l
 
     def multihead_attention(self, queries, sequence_length):
-        Q = tf.layers.dense(queries, self.config.projection_szie,
+        Q = tf.layers.dense(queries, self.config.projection_szie, kernel_initializer=self.init,
                             activation=tf.nn.elu, kernel_regularizer=self.regularizer)
-        K = tf.layers.dense(queries, self.config.projection_szie,
+        K = tf.layers.dense(queries, self.config.projection_szie, kernel_initializer=self.init,
                             activation=tf.nn.elu, kernel_regularizer=self.regularizer)
-        V = tf.layers.dense(queries, self.config.projection_szie,
+        V = tf.layers.dense(queries, self.config.projection_szie, kernel_initializer=self.init,
                             activation=tf.nn.elu, kernel_regularizer=self.regularizer)
         Q_ = tf.concat(tf.split(Q, self.config.num_heads, axis=2), axis=0)
         K_ = tf.concat(tf.split(K, self.config.num_heads, axis=2), axis=0)
@@ -178,6 +181,63 @@ class SSQANet(object):
         outputs = tf.concat(tf.split(outputs, self.config.num_heads, axis=0), axis=2)
 
         return outputs
+
+    def quadlinear_attention(self, questions, contexts, document_vector):
+        # f(q,c) = W[q,c, q*c]
+        # Q : [b, m, d] -> [b, n, m, d]
+        # C : [b, n, d] -> [b, n, m, d]
+        # D : [b,d]
+        m = tf.shape(questions)[1]
+        n = tf.shape(contexts)[1]
+        questions = tf.tile(tf.expand_dims(questions, axis=1), [1, n, 1, 1])
+        contexts = tf.tile(tf.expand_dims(contexts, axis=2), [1, 1, m, 1])
+        docs = tf.expand_dims(tf.expand_dims(document_vector, axis=1), 1)
+        docs = tf.tile(docs, [1, n, m, 1])
+        tri = tf.concat([questions, contexts, questions * contexts, docs], axis=-1)
+        # [b, n, m, 1] -> [b, n, m]
+        score = tf.layers.dense(tri, 1, activation=None,
+                                use_bias=False, kernel_regularizer=self.regularizer)
+        score = tf.squeeze(score, axis=-1)
+        return score
+
+    def co_attention(self, questions, contexts, questions_lengths, contexts_lengths):
+        # context to query attention
+        # Q :[b, m, d], C :[b, n, d]
+        # S : [b, n, m]
+        n = tf.shape(contexts)[1]
+        m = tf.shape(questions)[1]
+        attention_score = self.quadlinear_attention(questions, contexts)
+        S = attention_score
+        # key masking : [b, m]
+        key_masks = tf.sequence_mask(questions_lengths, dtype=tf.float32)
+        key_masks = tf.tile(tf.expand_dims(key_masks, 1), [1, n, 1])
+        paddings = tf.ones_like(key_masks) * (-2 ** 32 + 1)
+        S = tf.where(tf.equal(key_masks, 0), paddings, S)
+        S = tf.nn.softmax(S)
+        # query_mask
+        query_masks = tf.sequence_mask(contexts_lengths, dtype=tf.float32)
+        query_masks = tf.expand_dims(query_masks, 2)
+        S *= query_masks
+        # S :[b, n, m], Q: [b, m, d], A :[b,n,d]
+        A = tf.matmul(S, questions)
+
+        S_ = tf.transpose(attention_score, [0, 2, 1])
+        # key masks
+        key_masks = tf.sequence_mask(contexts_lengths, dtype=tf.float32)
+        key_masks = tf.tile(tf.expand_dims(key_masks, 1), [1, m, 1])
+
+        paddings = tf.ones_like(key_masks) * (-2 ** 32 + 1)
+        S_ = tf.where(tf.equal(key_masks, 0), paddings, S_)
+        S_ = tf.nn.softmax(S_)
+
+        query_masks = tf.sequence_mask(questions_lengths, dtype=tf.float32)
+        query_masks = tf.expand_dims(query_masks, 2)
+        S_ *= query_masks
+
+        q2c = tf.matmul(S_, contexts)
+        B = tf.matmul(S, q2c)
+
+        return A, B
 
     def bi_lstm_embedding(self, inputs, sequence_length, scope, reuse, return_last=False):
         with tf.variable_scope(scope, reuse=reuse):
@@ -320,4 +380,3 @@ class SSQANet(object):
         _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
         return loss, acc, pred
 
-    # TODO : implement QA module
