@@ -108,7 +108,13 @@ class SSQANet(object):
             self.loss = self.cross_entropy_loss \
                         + self.config.alpha * self.attention_loss \
                         + self.config.beta * self.binary_loss
-
+        # for inference
+        logits1 = tf.nn.softmax(start_logits)
+        logits2 = tf.nn.softmax(end_logits)
+        outer_product = tf.matmul(tf.expand_dims(logits1, axis=2), tf.expand_dims(logits2, axis=1))
+        outer = tf.matrix_band_part(outer_product, 0, self.config.ans_limit)
+        self.start = tf.argmax(tf.reduce_max(outer, axis=2), axis=1)
+        self.end = tf.argmax(tf.reduce_max(outer, axis=1), axis=1)
         if self.config.l2_lambda > 0:
             vars = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
             l2_loss = layers.apply_regularization(self.regularizer, vars)
@@ -484,8 +490,24 @@ class SSQANet(object):
             self.sentence_idx: sentence_idx,
             self.answerable: answerable,
             self.answer_span: spans,
-            self.dropout:dropout
+            self.dropout: dropout
         }
         output_feed = [self.train_op, self.loss, self.acc, self.preds]
         _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
         return loss, acc, pred
+
+    def infer(self, questions, question_length, contexts,
+              context_lengths, sentences, sequence_lengths, sentence_lengths):
+        feed_dict = {
+            self.questions: questions,
+            self.question_legnths: question_length,
+            self.contexts: contexts,
+            self.context_legnths: context_lengths,
+            self.sentences: sentences,
+            self.sequence_lengths: sequence_lengths,
+            self.sentence_lengths: sentence_lengths,
+            self.dropout: 1.0
+        }
+        output_feed = [self.start, self.end]
+        start, end = self.sess.run(output_feed, feed_dict)
+        return start, end
