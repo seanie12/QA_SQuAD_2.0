@@ -104,6 +104,8 @@ def load_data(input_file, vocab, debug=False):
             questions.append(q_tok2idx)
             # remove sentence delimeter, tokenize and append it to list
             c_tokens = context.replace("</s>", "").split()
+            # map token to its idx
+            c_tokens = list(map(lambda token: vocab.word2idx(token), c_tokens))
             contexts.append(c_tokens)
             # split paragraphs into sentences
             c_sentences = context.split("</s>")
