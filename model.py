@@ -3,6 +3,7 @@ from tensorflow.contrib import layers
 import math
 
 
+# TODO: GloVE, ELMO embedding
 class SSQANet(object):
     def __init__(self, config):
         self.config = config
@@ -63,7 +64,9 @@ class SSQANet(object):
             document_vector, sentence_score = self.sentence_level_attention(encoded_question, sentence_vectors,
                                                                             self.sentence_size, self.sentence_lengths)
 
-            self.attention_loss, self.binary_loss = self.auxiliary_loss(sentence_score, document_vector)
+            self.attention_loss, self.binary_loss = self.auxiliary_loss(sentence_score,
+                                                                        document_vector,
+                                                                        encoded_question)
         with tf.variable_scope("Context_Query_Attention_Layer"):
             A, B = self.co_attention(questions, contexts, document_vector,
                                      self.question_legnths, self.context_legnths)
@@ -409,13 +412,18 @@ class SSQANet(object):
                                            self.config.lstm_size * 2])
             return sentence_vectors
 
-    def auxiliary_loss(self, attention_score, document_vector):
+    def auxiliary_loss(self, attention_score, document_vector, question_vector):
         # [b * s ,1] -> [b, s]
         attention_logits = tf.squeeze(attention_score, axis=-1)
         attention_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=attention_logits,
                                                                         labels=self.sentence_idx)
         attention_loss = tf.reduce_mean(attention_loss)
-        binary_logits = layers.fully_connected(document_vector, 2, activation_fn=None)
+        logits_input = tf.concat([document_vector, question_vector], axis=-1)
+        binary_logits = tf.layers.dense(logits_input, 2,
+                                        kernel_initializer=layers.xavier_initializer(),
+                                        kernel_regularizer=self.regularizer,
+                                        use_bias=True,
+                                        activation=None)
         self.preds = tf.argmax(binary_logits, axis=1, output_type=tf.int32)
         correct_pred = tf.equal(self.preds, self.answerable)
         self.acc = tf.reduce_mean(tf.cast(correct_pred, dtype=tf.float32))
@@ -425,9 +433,9 @@ class SSQANet(object):
 
         return attention_loss, logistic_loss
 
-    def sentence_level_attention(self, question_lstm, sentence_vectors, sentence_size, sentence_lengths):
+    def sentence_level_attention(self, question_vector, sentence_vectors, sentence_size, sentence_lengths):
         with tf.variable_scope("sentence_attention") as scope:
-            query = tf.tile(tf.expand_dims(question_lstm, 1), [1, self.sentence_size, 1])
+            query = tf.tile(tf.expand_dims(question_vector, 1), [1, self.sentence_size, 1])
             # [b, s, 2 * d]
             document_lstm = self.bi_lstm_embedding(sentence_vectors,
                                                    sentence_lengths,
@@ -454,9 +462,6 @@ class SSQANet(object):
             attention_weight = tf.nn.softmax(attention_score, 1)
             document_vector = tf.reduce_sum(document_lstm * attention_weight, axis=1)
             return document_vector, attention_score
-            # self.attention_loss, self.logistic_loss = self.auxiliary_loss(attention_score,
-            #                                                               self.document_vector)
-            # self.loss = self.config.alpha * self.attention_loss + self.logistic_loss
 
     def add_train_op(self):
         with tf.variable_scope("adam_opt"):
