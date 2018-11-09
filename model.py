@@ -53,6 +53,7 @@ class SSQANet(object):
                                             scope="Embedding_Encoder", reuse=True)
 
         with tf.variable_scope("hierarchical_attention"):
+            # [b * s, w, d]
             reshaped_sentences = tf.reshape(self.embedded_sentences,
                                             [-1, self.word_size, self.config.embedding_size])
             sentence_lengths = tf.reshape(self.sequence_lengths, [-1])
@@ -85,29 +86,35 @@ class SSQANet(object):
                                               scope="Model_Encoder",
                                               reuse=True if i > 0 else False)
                 if i == 2:
-                    outputs = tf.nn.dropout(outputs, self.dropout)
+                    outputs = tf.layers.dropout(outputs, self.dropout)
                 memories.append(outputs)
                 inputs = outputs
 
         with tf.variable_scope("Output_Layer"):
             logits_inputs = tf.concat([memories[0], memories[1]], axis=2)
-            start_logits = tf.layers.dense(logits_inputs, 1, activation=None,
-                                           kernel_initializer=layers.xavier_initializer(),
-                                           kernel_regularizer=self.regularizer)
-            start_logits = tf.squeeze(start_logits, axis=-1)
-            start_logits = self.mask_logits(start_logits, self.context_legnths)
+            start_logits = self.pointer_network(document_vector, logits_inputs,
+                                                self.context_legnths, scope="start_logits")
             logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
-            end_logits = tf.layers.dense(logits_inputs, 1, activation=None,
-                                         kernel_initializer=layers.xavier_initializer(),
-                                         kernel_regularizer=self.regularizer)
-            end_logits = tf.squeeze(end_logits, axis=-1)
-            end_logits = self.mask_logits(end_logits, self.context_legnths)
+            end_logits = self.pointer_network(document_vector, logits_inputs,
+                                              self.context_legnths, scope="end_logits")
+            # start_logits = tf.layers.dense(logits_inputs, 1, activation=None,
+            #                                kernel_initializer=layers.xavier_initializer(),
+            #                                kernel_regularizer=self.regularizer)
+            # start_logits = tf.squeeze(start_logits, axis=-1)
+            # start_logits = self.mask_logits(start_logits, self.context_legnths)
+            #
+            # logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
+            # end_logits = tf.layers.dense(logits_inputs, 1, activation=None,
+            #                              kernel_initializer=layers.xavier_initializer(),
+            #                              kernel_regularizer=self.regularizer)
+            # end_logits = tf.squeeze(end_logits, axis=-1)
+            # end_logits = self.mask_logits(end_logits, self.context_legnths)
             start_label, end_label = tf.split(self.answer_span, 2, axis=1)
             start_label = tf.squeeze(start_label, axis=-1)
             end_label = tf.squeeze(end_label, axis=-1)
             losses1 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=start_logits, labels=start_label)
             losses2 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=end_logits, labels=end_label)
-            self.cross_entropy_loss = tf.reduce_sum(losses1 + losses2)
+            self.cross_entropy_loss = tf.reduce_mean(losses1 + losses2)
             self.loss = self.cross_entropy_loss \
                         + self.config.alpha * self.attention_loss \
                         + self.config.beta * self.binary_loss
@@ -136,6 +143,18 @@ class SSQANet(object):
 
         self.add_train_op()
         self.init_session()
+
+    def pointer_network(self, query, keys, sequence_lengths, scope, reuse=False):
+        # query : [b,d], keys: [b,t,d]
+        with tf.variable_scope(scope, reuse=reuse):
+            units = query.shape[-1]
+            trans = tf.layers.dense(keys, units,
+                                    activation=None, use_bias=False)
+            q = tf.expand_dims(query, axis=-1)
+            # [b,t,1] -> [b,t]
+            attention = tf.squeeze(tf.matmul(trans, q), axis=-1)
+            masked = self.mask_logits(attention, sequence_lengths)
+        return masked
 
     def mask_logits(self, logits, sequence_lengths):
         mask = tf.sequence_mask(sequence_lengths, dtype=tf.float32)
@@ -180,7 +199,7 @@ class SSQANet(object):
 
     def layer_dropout(self, inputs, residual, dropout):
         cond = tf.random_uniform([]) < dropout
-        return tf.cond(cond, lambda: residual, lambda: tf.nn.dropout(inputs, self.dropout) + residual)
+        return tf.cond(cond, lambda: residual, lambda: tf.layers.dropout(inputs, self.dropout) + residual)
 
     def residual_block(self, inputs, sequence_length, num_blocks, num_conv_blocks,
                        kernel_size, num_filters, scope, reuse):
@@ -216,10 +235,10 @@ class SSQANet(object):
                 normalized = layers.layer_norm(inputs)
                 if i % 2 == 0:
                     # apply dropout
-                    normalized = tf.nn.dropout(normalized, self.dropout)
+                    normalized = tf.layers.dropout(normalized, self.dropout)
                 outputs = self.depthwise_separable_conv(normalized, kernel_size, num_filters,
                                                         scope="depthwise_conv_{}".format(i), reuse=reuse)
-                outputs = self.layer_dropout(outputs, residual, self.dropout)
+                outputs = self.layer_dropout(outputs, residual, self.dropout * float(l) / L)
             return outputs, l
 
     def depthwise_separable_conv(self, inputs, kernel_size, num_filters, scope, reuse):
@@ -250,18 +269,18 @@ class SSQANet(object):
         with tf.variable_scope(scope, reuse=reuse):
             l, L = sublayers
             inputs = layers.layer_norm(inputs)
-            inputs = tf.nn.dropout(inputs, self.dropout)
+            inputs = tf.layers.dropout(inputs, self.dropout)
             outputs = self.multihead_attention(inputs, sequence_length)
-            outputs = self.layer_dropout(outputs, inputs, (1 - self.dropout) * l / float(L))
+            outputs = self.layer_dropout(outputs, inputs, self.dropout * l / float(L))
             l += 1
             # FFN
             residual = layers.layer_norm(outputs)
-            outputs = tf.nn.dropout(outputs, self.dropout)
+            outputs = tf.layers.dropout(outputs, self.dropout)
             hiddens = tf.layers.dense(outputs, self.config.attention_size * 2,
                                       activation=tf.nn.elu)
             fc_outputs = tf.layers.dense(hiddens, self.config.attention_size,
                                          activation=None)
-            outputs = self.layer_dropout(residual, fc_outputs, (1 - self.dropout) * l / float(L))
+            outputs = self.layer_dropout(residual, fc_outputs, self.dropout * l / float(L))
 
         return outputs, l
 
@@ -296,7 +315,7 @@ class SSQANet(object):
         query_mask = tf.tile(query_mask, [self.config.num_heads, 1])
         query_mask = tf.expand_dims(query_mask, axis=2)
         weight *= query_mask
-        weight = tf.nn.dropout(weight, self.dropout)
+        weight = tf.layers.dropout(weight, self.dropout)
         outputs = tf.matmul(weight, V_)
         outputs = tf.concat(tf.split(outputs, self.config.num_heads, axis=0), axis=2)
 
@@ -313,7 +332,23 @@ class SSQANet(object):
         contexts = tf.tile(tf.expand_dims(contexts, axis=2), [1, 1, m, 1])
         docs = tf.expand_dims(tf.expand_dims(document_vector, axis=1), 1)
         docs = tf.tile(docs, [1, n, m, 1])
-        tri = tf.concat([questions, contexts, questions * contexts, docs], axis=-1)
+        quad = tf.concat([questions, contexts, questions * contexts, docs], axis=-1)
+        # [b, n, m, 1] -> [b, n, m]
+        score = tf.layers.dense(quad, 1, activation=None,
+                                use_bias=False, kernel_regularizer=self.regularizer)
+        score = tf.squeeze(score, axis=-1)
+        return score
+
+    def trilinear_attention(self, questions, contexts):
+        # f(q,c) = W[q,c, q*c]
+        # Q : [b, m, d] -> [b, n, m, d]
+        # C : [b, n, d] -> [b, n, m, d]
+        # D : [b,d]
+        m = tf.shape(questions)[1]
+        n = tf.shape(contexts)[1]
+        questions = tf.tile(tf.expand_dims(questions, axis=1), [1, n, 1, 1])
+        contexts = tf.tile(tf.expand_dims(contexts, axis=2), [1, 1, m, 1])
+        tri = tf.concat([questions, contexts, questions * contexts], axis=-1)
         # [b, n, m, 1] -> [b, n, m]
         score = tf.layers.dense(tri, 1, activation=None,
                                 use_bias=False, kernel_regularizer=self.regularizer)
@@ -322,16 +357,17 @@ class SSQANet(object):
 
     def co_attention(self, questions, contexts, document_vector, questions_lengths, contexts_lengths):
         # context to query attention
-        # Q :[b, m, d], C :[b, n, d]
+        # Q :[b, m, d], C :[b, n, d], D : [b, d]
         # S : [b, n, m]
         n = tf.shape(contexts)[1]
         m = tf.shape(questions)[1]
-        attention_score = self.quadlinear_attention(questions, contexts, document_vector)
+        # attention_score = self.quadlinear_attention(questions, contexts, document_vector)
+        attention_score = self.trilinear_attention(questions, contexts)
         S = attention_score
         # key masking : [b, m]
         key_masks = tf.sequence_mask(questions_lengths, dtype=tf.float32)
         key_masks = tf.tile(tf.expand_dims(key_masks, 1), [1, n, 1])
-        paddings = tf.ones_like(key_masks) * (-2 ** 32 + 1)
+        paddings = tf.ones_like(S) * (-2 ** 32 + 1)
         S = tf.where(tf.equal(key_masks, 0), paddings, S)
         S = tf.nn.softmax(S)
         # query_mask
@@ -346,7 +382,7 @@ class SSQANet(object):
         key_masks = tf.sequence_mask(contexts_lengths, dtype=tf.float32)
         key_masks = tf.tile(tf.expand_dims(key_masks, 1), [1, m, 1])
 
-        paddings = tf.ones_like(key_masks) * (-2 ** 32 + 1)
+        paddings = tf.ones_like(S_) * (-2 ** 32 + 1)
         S_ = tf.where(tf.equal(key_masks, 0), paddings, S_)
         S_ = tf.nn.softmax(S_)
 
@@ -367,6 +403,7 @@ class SSQANet(object):
                                                                               inputs, sequence_length,
                                                                               dtype=tf.float32)
             outputs = tf.concat(outputs, axis=-1)
+            outputs = tf.layers.dropout(outputs, self.dropout)
             last_states = tf.concat([fw_states[-1], bw_states[-1]], axis=1)
             if return_last:
                 return last_states
