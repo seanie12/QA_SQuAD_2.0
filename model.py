@@ -69,12 +69,12 @@ class SSQANet(object):
                                                                         document_vector,
                                                                         encoded_question)
         with tf.variable_scope("Context_Query_Attention_Layer"):
-            A, B = self.co_attention(questions, contexts, document_vector,
+            A, B = self.co_attention(questions, contexts,
                                      self.question_legnths, self.context_legnths)
             attention_outputs = [contexts, A, contexts * A, contexts * B]
         with tf.variable_scope("Model_Encoder_Layer"):
             inputs = tf.concat(attention_outputs, axis=2)
-            inputs = tf.layers.dense(inputs, self.config.embedding_size,
+            inputs = tf.layers.dense(inputs, self.config.attention_size,
                                      kernel_regularizer=self.regularizer,
                                      kernel_initializer=layers.variance_scaling_initializer(),
                                      activation=tf.nn.relu)
@@ -97,18 +97,7 @@ class SSQANet(object):
             logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
             end_logits = self.pointer_network(document_vector, logits_inputs,
                                               self.context_legnths, scope="end_logits")
-            # start_logits = tf.layers.dense(logits_inputs, 1, activation=None,
-            #                                kernel_initializer=layers.xavier_initializer(),
-            #                                kernel_regularizer=self.regularizer)
-            # start_logits = tf.squeeze(start_logits, axis=-1)
-            # start_logits = self.mask_logits(start_logits, self.context_legnths)
-            #
-            # logits_inputs = tf.concat([memories[0], memories[2]], axis=2)
-            # end_logits = tf.layers.dense(logits_inputs, 1, activation=None,
-            #                              kernel_initializer=layers.xavier_initializer(),
-            #                              kernel_regularizer=self.regularizer)
-            # end_logits = tf.squeeze(end_logits, axis=-1)
-            # end_logits = self.mask_logits(end_logits, self.context_legnths)
+
             start_label, end_label = tf.split(self.answer_span, 2, axis=1)
             start_label = tf.squeeze(start_label, axis=-1)
             end_label = tf.squeeze(end_label, axis=-1)
@@ -355,7 +344,7 @@ class SSQANet(object):
         score = tf.squeeze(score, axis=-1)
         return score
 
-    def co_attention(self, questions, contexts, document_vector, questions_lengths, contexts_lengths):
+    def co_attention(self, questions, contexts, questions_lengths, contexts_lengths):
         # context to query attention
         # Q :[b, m, d], C :[b, n, d], D : [b, d]
         # S : [b, n, m]
