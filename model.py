@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow.contrib import layers
 import math
+import os
 
 
 # TODO: GloVE, ELMO embedding
@@ -34,10 +35,12 @@ class SSQANet(object):
         self.document_size, self.sentence_size, self.word_size = tf.unstack(tf.shape(self.sentences))
         # add embeddings
         zeros = tf.constant([[0.0] * self.config.embedding_size])
-        embedding_matrix = tf.get_variable(shape=[self.config.vocab_size - 1, self.config.embedding_size],
-                                           initializer=layers.xavier_initializer(), name="embedding")
-
-        self.embedding_matrix = tf.concat([zeros, embedding_matrix], axis=0)
+        unk_dummy = tf.get_variable(shape=[2, self.config.embedding_size],
+                                    initializer=layers.xavier_initializer(), name="special_token")
+        # load pre-trained GloVe
+        embedding_matrix = tf.Variable(initial_value=self.config.embeddings, trainable=False,
+                                       dtype=tf.float32, name="embedding")
+        self.embedding_matrix = tf.concat([zeros, unk_dummy, embedding_matrix], axis=0)
         self.embedded_words = tf.nn.embedding_lookup(self.embedding_matrix, self.input_words)
         self.embedded_sentences = tf.nn.embedding_lookup(self.embedding_matrix, self.sentences)
         self.embedded_context = tf.nn.embedding_lookup(self.embedding_matrix, self.contexts)
@@ -103,8 +106,8 @@ class SSQANet(object):
             end_label = tf.squeeze(end_label, axis=-1)
             losses1 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=start_logits, labels=start_label)
             losses2 = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=end_logits, labels=end_label)
-            self.cross_entropy_loss = tf.reduce_mean(losses1 + losses2)
-            self.loss = self.cross_entropy_loss \
+            cross_entropy_loss = tf.reduce_mean(losses1 + losses2)
+            self.loss = cross_entropy_loss \
                         + self.config.alpha * self.attention_loss \
                         + self.config.beta * self.binary_loss
         # for inference
@@ -112,8 +115,9 @@ class SSQANet(object):
         logits2 = tf.nn.softmax(end_logits)
         outer_product = tf.matmul(tf.expand_dims(logits1, axis=2), tf.expand_dims(logits2, axis=1))
         outer = tf.matrix_band_part(outer_product, 0, self.config.ans_limit)
-        self.start = tf.argmax(tf.reduce_max(outer, axis=2), axis=1)
-        self.end = tf.argmax(tf.reduce_max(outer, axis=1), axis=1)
+        self.start = tf.argmax(tf.reduce_max(outer, axis=2), axis=1, output_type=tf.int32)
+        self.end = tf.argmax(tf.reduce_max(outer, axis=1), axis=1, output_type=tf.int32)
+        self.em = self.evaluate_em(self.start, self.end, self.answer_span)
         if self.config.l2_lambda > 0:
             vars = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
             l2_loss = layers.apply_regularization(self.regularizer, vars)
@@ -132,6 +136,17 @@ class SSQANet(object):
 
         self.add_train_op()
         self.init_session()
+
+    @staticmethod
+    def evaluate_em(start_preds, end_preds, answer_spans):
+        ans_start, ans_end = tf.split(answer_spans, 2, axis=1)
+        ans_start = tf.squeeze(ans_start, axis=1)
+        ans_end = tf.squeeze(ans_end, axis=1)
+        correct_start = tf.equal(start_preds, ans_start)
+        correct_end = tf.equal(end_preds, ans_end)
+        total_correct = tf.cast(tf.logical_and(correct_start, correct_end), dtype=tf.float32)
+        em = tf.reduce_mean(total_correct)
+        return em
 
     def pointer_network(self, query, keys, sequence_lengths, scope, reuse=False):
         # query : [b,d], keys: [b,t,d]
@@ -338,7 +353,7 @@ class SSQANet(object):
         questions = tf.tile(tf.expand_dims(questions, axis=1), [1, n, 1, 1])
         contexts = tf.tile(tf.expand_dims(contexts, axis=2), [1, 1, m, 1])
         tri = tf.concat([questions, contexts, questions * contexts], axis=-1)
-        # [b, n, m, 1] -> [b, n, m]
+        # [b, n, m, 3d] -> [b, n, m, 1] -> [b, n, m]
         score = tf.layers.dense(tri, 1, activation=None,
                                 use_bias=False, kernel_regularizer=self.regularizer)
         score = tf.squeeze(score, axis=-1)
@@ -408,11 +423,12 @@ class SSQANet(object):
                             [sentence_size, word_size, 1])
             attention_input = tf.concat([query, sentence_lstm], axis=2)
             # [b * s, w, attention_size]
-            projected = layers.fully_connected(attention_input,
-                                               self.config.attention_size,
-                                               weights_initializer=layers.variance_scaling_initializer(),
-                                               weights_regularizer=self.regularizer,
-                                               activation_fn=tf.nn.elu)
+            projected = tf.layers.dense(attention_input,
+                                        self.config.attention_size,
+                                        kernel_initializer=layers.variance_scaling_initializer(),
+                                        kernel_regularizer=self.regularizer,
+                                        activation=tf.nn.elu)
+            projected = tf.layers.dropout(projected, self.dropout)
             v = tf.get_variable(shape=[self.config.attention_size, 1],
                                 initializer=layers.xavier_initializer(),
                                 regularizer=self.regularizer,
@@ -467,14 +483,17 @@ class SSQANet(object):
                                                    sentence_lengths,
                                                    scope, reuse=False)
             attention_input = tf.concat([query, document_lstm], axis=2)
-            projected = layers.fully_connected(attention_input,
-                                               self.config.attention_size,
-                                               weights_initializer=layers.xavier_initializer(),
-                                               weights_regularizer=self.regularizer,
-                                               activation_fn=tf.nn.elu)
+            projected = tf.layers.dense(attention_input,
+                                        self.config.attention_size,
+                                        kernel_initializer=layers.xavier_initializer(),
+                                        kernel_regularizer=self.regularizer,
+                                        activation=tf.nn.elu)
+            projected = tf.layers.dropout(projected, self.dropout)
             # [b ,s, d] -> [b * s, d]
             reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
-            v = tf.get_variable(shape=[self.config.attention_size, 1], name="v", regularizer=self.regularizer)
+            v = tf.get_variable(shape=[self.config.attention_size, 1], name="v",
+                                initializer=layers.xavier_initializer(),
+                                regularizer=self.regularizer)
             attention_score = tf.matmul(reshaped_projected, v)
             # [b * s, 1] -> [b, s, 1]
             attention_score = tf.reshape(attention_score, [-1, sentence_size, 1])
@@ -508,6 +527,14 @@ class SSQANet(object):
         self.sess.run(tf.global_variables_initializer())
         self.saver = tf.train.Saver()
 
+    def save_session(self, path):
+        if not os.path.exists(path):
+            os.makedirs(path)
+        self.saver.save(self.sess, path)
+
+    def restore_session(self, path):
+        self.saver.restore(self.sess, path)
+
     def train(self, questions, question_length, contexts, context_lengths, sentences, sequence_length,
               sentence_length, sentence_idx, answerable, spans, dropout=1.0):
         feed_dict = {
@@ -523,9 +550,27 @@ class SSQANet(object):
             self.answer_span: spans,
             self.dropout: dropout
         }
-        output_feed = [self.train_op, self.loss, self.acc, self.preds]
-        _, loss, acc, pred = self.sess.run(output_feed, feed_dict)
-        return loss, acc, pred
+        output_feed = [self.train_op, self.loss, self.acc, self.preds, self.global_step]
+        _, loss, acc, pred, step = self.sess.run(output_feed, feed_dict)
+        return loss, acc, pred, step
+
+    def eval(self, questions, question_length, contexts,
+             context_lengths, sentences, sequence_lengths, sentence_lengths, answerable, span):
+        feed_dict = {
+            self.questions: questions,
+            self.question_legnths: question_length,
+            self.contexts: contexts,
+            self.context_legnths: context_lengths,
+            self.sentences: sentences,
+            self.sequence_lengths: sequence_lengths,
+            self.sentence_lengths: sentence_lengths,
+            self.answerable: answerable,
+            self.answer_span: span,
+            self.dropout: 0.0
+        }
+        output_feed = [self.acc, self.em]
+        acc, em = self.sess.run(output_feed, feed_dict)
+        return acc, em
 
     def infer(self, questions, question_length, contexts,
               context_lengths, sentences, sequence_lengths, sentence_lengths):
@@ -537,7 +582,7 @@ class SSQANet(object):
             self.sentences: sentences,
             self.sequence_lengths: sequence_lengths,
             self.sentence_lengths: sentence_lengths,
-            self.dropout: 1.0
+            self.dropout: 0.0
         }
         output_feed = [self.start, self.end]
         start, end = self.sess.run(output_feed, feed_dict)

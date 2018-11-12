@@ -67,6 +67,9 @@ class Vocab(object):
         else:
             return self._word2idx[UNK]
 
+    def size(self):
+        return len(self._word2idx)
+
 
 def batch_loader(iterable, batch_size, shuffle=False):
     length = len(iterable)
@@ -87,7 +90,7 @@ def load_data(input_file, vocab, debug=False):
         answerable = []
         for i, line in enumerate(f):
             # debug mode
-            if debug and i == 100:
+            if debug and i == 10:
                 break
             # question / context / start_idx / end_idx / oracle_sentence_idx / answerable
             contents = line.split("\t")
@@ -123,7 +126,7 @@ def zero_padding(inputs, level):
         sequence_length = [len(doc) for doc in inputs]
         max_length = max(sequence_length)
         padded_docs = list(map(lambda doc: doc + [ID_PAD] * (max_length - len(doc)), inputs))
-        return sequence_length, padded_docs
+        return np.array(sequence_length), np.array(padded_docs)
 
     elif level == 2:
         max_doc_len = max([len(doc) for doc in inputs])
@@ -149,6 +152,27 @@ def zero_padding(inputs, level):
         return np.array(sequence_length), np.array(doc_lengths), np.array(padded_docs)
 
 
+def save_glove(vocab: Vocab, dim, glove_filename, output_file: str):
+    embeddings = np.zeros([vocab.size() - 3, dim], dtype=np.float32)
+    print("load GLoVe")
+    with open(glove_filename, "r", encoding="utf-8") as f:
+        for line in f:
+            # word dim1 dim2 ....
+            tokens = line.strip().split(" ")
+            word = tokens[0]
+            word_vec = [float(x) for x in tokens[1:]]
+            idx = vocab.word2idx(word) - len(special_tokens)
+            # idx 0 : PAD, idx 1: <d>, idx 2: <unk>
+            if idx >= 0:
+                embeddings[idx] = word_vec
+    np.savez_compressed(output_file, embeddings=embeddings)
+
+
+def load_glove(filename):
+    with np.load(filename) as f:
+        return f["embeddings"]
+
+
 if __name__ == "__main__":
     vocab = Vocab("data/train.txt", "data/vocab", 5e4, load=True)
     docs = [
@@ -156,8 +180,12 @@ if __name__ == "__main__":
         [[5, 7], [8, 9, 11], [1], [5]],
         [[1]]
     ]
+    contexts = [[1, 2, 3], [5, 6, 7, 1, 2], [3, 4]]
     q, c, sentences, span, sent_idx, answerable = load_data("data/train.txt", vocab, debug=True)
     sequence_length_, doc_lengths_, padded_docs_ = zero_padding(sentences, level=2)
+    context_lengths, padded_c = zero_padding(contexts, level=1)
+    print(context_lengths, context_lengths.shape)
+    print(padded_c)
     print(sequence_length_, sequence_length_.shape)
     print(doc_lengths_, doc_lengths_.shape)
     print(padded_docs_)
