@@ -1,5 +1,7 @@
 import numpy as np
 import random
+from tqdm import tqdm
+import pickle
 
 PAD = "<PAD>"
 DUMMY = "<d>"
@@ -11,31 +13,33 @@ special_tokens = [PAD, DUMMY, UNK]
 
 
 class Vocab(object):
-    def __init__(self, input_file, vocab_file, max_vocab_size, load=False):
-        # input file is tab delimiter question / context / answer/...
-        # we need question and context
-        self._word2idx = dict()
-        # read questions and context, and count frequency of each token
-        if load:
-            for token in special_tokens:
-                idx = len(self._word2idx)
-                self._word2idx[token] = idx
-            with open(vocab_file, "r", encoding="utf-8") as f:
-                count = len(special_tokens)
-                for line in f:
-                    word, freq = line.split("\t")
-                    if word not in self._word2idx:
-                        idx = len(self._word2idx)
-                        self._word2idx[word] = idx
-                        count += 1
-                        if count >= max_vocab_size:
-                            break
-        else:
-            Vocab.build_vocab(input_file, vocab_file)
+    def __init__(self, dict_file):
+        # before instantiate the class, you must call build_vocab()
+        with open(dict_file, "rb") as f:
+            self._word2idx = pickle.load(f)
 
     @staticmethod
-    def build_vocab(input_file, vocab_file):
+    def build_vocab(input_file, vocab_file, dict_file, glove_file, output_file, max_vocab_size):
+        tok2embedding = dict()
+
+        print("load glove")
+        with open(glove_file, "r", encoding="utf-8") as f:
+            for line in tqdm(f, total=int(2.2e6)):
+                line = line.strip()
+                tokens = line.split(" ")
+                word = tokens[0]
+                word_vec = list(map(lambda x: float(x), tokens[1:]))
+                tok2embedding[word] = word_vec
+        print("finish loading")
+
+        # input file is tab delimiter question / context / answer/...
+        # we need question and context
         counter = dict()
+        tok2idx = dict()
+        for token in special_tokens:
+            idx = len(tok2idx)
+            if token not in tok2idx:
+                tok2idx[token] = idx
         with open(input_file, "r", encoding="utf-8") as f:
             for line in f:
                 contents = line.split("\t")
@@ -57,9 +61,17 @@ class Vocab(object):
                         counter[c_token] = 1
         # sort frequency by descending order
         sorted_counter = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
+        count = len(tok2idx)
         with open(vocab_file, "w", encoding="utf-8") as f:
             for word, freq in sorted_counter:
                 f.write(word + "\t" + str(freq) + "\n")
+                if word in tok2embedding and count < max_vocab_size:
+                    idx = len(tok2idx)
+                    tok2idx[word] = idx
+                    count += 1
+        with open(dict_file, "wb") as f:
+            pickle.dump(tok2idx, f)
+        save_glove(tok2embedding, tok2idx, output_file)
 
     def word2idx(self, word):
         if word in self._word2idx:
@@ -90,12 +102,27 @@ def load_data(input_file, vocab, debug=False):
         answerable = []
         for i, line in enumerate(f):
             # debug mode
-            if debug and i == 10:
+            if debug and i == 100:
                 break
             # question / context / start_idx / end_idx / oracle_sentence_idx / answerable
             contents = line.split("\t")
             q = contents[0]
             context = contents[1]
+            # remove sentence delimeter, tokenize and append it to list
+            c_tokens = context.replace("</s>", "").split()
+            # map token to its idx
+            c_tokens = list(map(lambda token: vocab.word2idx(token), c_tokens))
+            if len(c_tokens) > 400:
+                continue
+            contexts.append(c_tokens)
+            # split paragraphs into sentences
+            c_sentences = context.split("</s>")
+            # tokenize each sentence, map token to idx and append it to list
+            # [[word1, word2, word3..], [word4, word5..]]
+            c_tokenized_sentences = list(
+                map(lambda sentence: [vocab.word2idx(word) for word in sentence.split()], c_sentences))
+            sentences.append(c_tokenized_sentences)
+
             # append answer spans, sentence_idx, and answerable
             spans.append([int(contents[2]), int(contents[3])])
             sentence_idx.append(int(contents[4]))
@@ -105,18 +132,10 @@ def load_data(input_file, vocab, debug=False):
             # map token to idx
             q_tok2idx = list(map(lambda token: vocab.word2idx(token), q_tokens))
             questions.append(q_tok2idx)
-            # remove sentence delimeter, tokenize and append it to list
-            c_tokens = context.replace("</s>", "").split()
-            # map token to its idx
-            c_tokens = list(map(lambda token: vocab.word2idx(token), c_tokens))
-            contexts.append(c_tokens)
-            # split paragraphs into sentences
-            c_sentences = context.split("</s>")
-            # tokenize each sentence, map token to idx and append it to list
-            # [[word1, word2, word3..], [word4, word5..]]
-            c_tokenized_sentences = list(
-                map(lambda sentence: [vocab.word2idx(word) for word in sentence.split()], c_sentences))
-            sentences.append(c_tokenized_sentences)
+        # sort data by sequence length of contexts
+        data = zip(questions, contexts, sentences, spans, sentence_idx, answerable)
+        sorted_data = sorted(data, key=lambda x: len(x[1]))
+        questions, contexts, sentences, spans, sentence_idx, answerable = zip(*sorted_data)
         return questions, contexts, sentences, spans, sentence_idx, answerable
 
 
@@ -152,19 +171,19 @@ def zero_padding(inputs, level):
         return np.array(sequence_length), np.array(doc_lengths), np.array(padded_docs)
 
 
-def save_glove(vocab: Vocab, dim, glove_filename, output_file: str):
-    embeddings = np.zeros([vocab.size() - 3, dim], dtype=np.float32)
-    print("load GLoVe")
-    with open(glove_filename, "r", encoding="utf-8") as f:
-        for line in f:
-            # word dim1 dim2 ....
-            tokens = line.strip().split(" ")
-            word = tokens[0]
-            word_vec = [float(x) for x in tokens[1:]]
-            idx = vocab.word2idx(word) - len(special_tokens)
-            # idx 0 : PAD, idx 1: <d>, idx 2: <unk>
-            if idx >= 0:
-                embeddings[idx] = word_vec
+def save_glove(tok2embedding: dict, tok2idx: dict, output_file: str):
+    embeddings = np.zeros([len(tok2idx) - 3, 300], dtype=np.float32)
+    for i, token in enumerate(tok2idx.keys()):
+        # skip special tokens. tok2embedding does not contain special tokens for keys
+        try:
+            idx = tok2idx[token] - 3
+            word_vec = tok2embedding[token]
+            embeddings[idx] = word_vec
+        except KeyError:
+            continue
+    num_zeros = np.sum(embeddings, axis=1) == 0
+    num_zeros = np.sum(num_zeros)
+    print(num_zeros)
     np.savez_compressed(output_file, embeddings=embeddings)
 
 
@@ -174,7 +193,6 @@ def load_glove(filename):
 
 
 if __name__ == "__main__":
-    vocab = Vocab("data/train.txt", "data/vocab", 5e4, load=True)
     docs = [
         [[1, 2, 3, ], [4, 5, 6, 7, ]],
         [[5, 7], [8, 9, 11], [1], [5]],

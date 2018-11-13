@@ -17,7 +17,7 @@ class Config(object):
         self.embedding_size = 300
         self.lr = 1e-3
         self.lstm_size = 128
-        self.filter_size = 128
+        self.filter_size = 96
         self.attention_size = 128
         self.grad_clip = 5
         self.alpha = 1e-1

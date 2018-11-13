@@ -12,6 +12,8 @@ class SSQANet(object):
         self.saver = None
         self.regularizer = layers.l2_regularizer(self.config.l2_lambda)
         self.global_step = tf.Variable(0, trainable=False, name="global_step")
+        self.merged = None
+        self.summary_writer = None
 
     def build_model(self):
         # add place holder
@@ -59,17 +61,17 @@ class SSQANet(object):
             # [b * s, w, d]
             reshaped_sentences = tf.reshape(self.embedded_sentences,
                                             [-1, self.word_size, self.config.embedding_size])
-            cnn_inputs = tf.layers.dense(reshaped_sentences, self.config.attention_size,
+            cnn_inputs = tf.layers.dense(reshaped_sentences, self.config.filter_size,
                                          kernel_regularizer=self.regularizer,
                                          kernel_initializer=layers.xavier_initializer(),
                                          activation=tf.nn.relu)
-            sentence_cnn = self.conv_encoder(cnn_inputs, self.config.attention_size,
+            sentence_cnn = self.conv_encoder(cnn_inputs, self.config.filter_size,
                                              scope="word_encoder", reuse=False)
             encoded_question = self.question_encoding(questions, self.question_legnths)
             # [b, s, d]
             sentence_vectors = self.word_level_attention(encoded_question, sentence_cnn, self.document_size,
                                                          self.sentence_size, self.word_size, self.sequence_lengths)
-            sentence_cnn = self.conv_encoder(sentence_vectors, self.config.attention_size,
+            sentence_cnn = self.conv_encoder(sentence_vectors, self.config.filter_size,
                                              scope="sentence_encoder", reuse=False)
             document_vector, sentence_score = self.sentence_level_attention(encoded_question, sentence_cnn,
                                                                             self.sentence_size, self.sentence_lengths)
@@ -116,6 +118,8 @@ class SSQANet(object):
             self.loss = cross_entropy_loss \
                         + self.config.alpha * self.attention_loss \
                         + self.config.beta * self.binary_loss
+            tf.summary.scalar("loss", self.loss)
+
         # for inference
         logits1 = tf.nn.softmax(start_logits)
         logits2 = tf.nn.softmax(end_logits)
@@ -124,6 +128,8 @@ class SSQANet(object):
         self.start = tf.argmax(tf.reduce_max(outer, axis=2), axis=1, output_type=tf.int32)
         self.end = tf.argmax(tf.reduce_max(outer, axis=1), axis=1, output_type=tf.int32)
         self.em = self.evaluate_em(self.start, self.end, self.answer_span)
+        tf.summary.scalar("EM", self.em)
+        self.merged = tf.summary.merge_all()
         if self.config.l2_lambda > 0:
             vars = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
             l2_loss = layers.apply_regularization(self.regularizer, vars)
@@ -445,21 +451,18 @@ class SSQANet(object):
             attention_input = tf.concat([query, sentence_lstm], axis=2)
             # [b * s, w, attention_size]
             projected = tf.layers.dense(attention_input,
-                                        self.config.attention_size,
+                                        self.config.filter_size,
                                         kernel_initializer=layers.variance_scaling_initializer(),
                                         kernel_regularizer=self.regularizer,
                                         activation=tf.nn.elu)
             projected = tf.layers.dropout(projected, self.dropout)
-            v = tf.get_variable(shape=[self.config.attention_size, 1],
-                                initializer=layers.xavier_initializer(),
-                                regularizer=self.regularizer,
-                                name="v")
-            # [b * s, w , d] -> [b * s * w , d]
-            reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
-            # [b * s * w, 1]
-            attention_score = tf.matmul(reshaped_projected, v)
-            # reshape to original shape [b*s*w, 1] -> [b*s, w, 1]
-            attention_score = tf.reshape(attention_score, [-1, word_size, 1])
+
+            # reshape to original shape [b*s, w, d] -> [b*s, w, 1]
+            attention_score = tf.layers.dense(projected, 1,
+                                              use_bias=False,
+                                              kernel_initializer=layers.xavier_initializer(),
+                                              kernel_regularizer=self.regularizer,
+                                              activation=None)
 
             # -inf weight to zero padding
             sequence_length = tf.reshape(sequence_lengths, [-1])
@@ -472,29 +475,8 @@ class SSQANet(object):
             sentence_vector = tf.reduce_sum(sentence_lstm * attention_weight, axis=1)
             sentence_vectors = tf.reshape(sentence_vector,
                                           [document_size, sentence_size,
-                                           self.config.attention_size])
+                                           self.config.filter_size])
             return sentence_vectors
-
-    def auxiliary_loss(self, attention_score, document_vector, question_vector):
-        # [b * s ,1] -> [b, s]
-        attention_logits = tf.squeeze(attention_score, axis=-1)
-        attention_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=attention_logits,
-                                                                        labels=self.sentence_idx)
-        attention_loss = tf.reduce_mean(attention_loss)
-        logits_input = tf.concat([document_vector, question_vector], axis=-1)
-        binary_logits = tf.layers.dense(logits_input, 2,
-                                        kernel_initializer=layers.xavier_initializer(),
-                                        kernel_regularizer=self.regularizer,
-                                        use_bias=True,
-                                        activation=None)
-        self.preds = tf.argmax(binary_logits, axis=1, output_type=tf.int32)
-        correct_pred = tf.equal(self.preds, self.answerable)
-        self.acc = tf.reduce_mean(tf.cast(correct_pred, dtype=tf.float32))
-        logistic_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=binary_logits,
-                                                                       labels=self.answerable)
-        logistic_loss = tf.reduce_mean(logistic_loss)
-
-        return attention_loss, logistic_loss
 
     def sentence_level_attention(self, question_vector, sentence_vectors, sentence_size, sentence_lengths):
         with tf.variable_scope("sentence_attention"):
@@ -523,6 +505,27 @@ class SSQANet(object):
             document_vector = tf.reduce_sum(sentence_vectors * attention_weight, axis=1)
             return document_vector, attention_score
 
+    def auxiliary_loss(self, attention_score, document_vector, question_vector):
+        # [b * s ,1] -> [b, s]
+        attention_logits = tf.squeeze(attention_score, axis=-1)
+        attention_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=attention_logits,
+                                                                        labels=self.sentence_idx)
+        attention_loss = tf.reduce_mean(attention_loss)
+        logits_input = tf.concat([document_vector, question_vector], axis=-1)
+        binary_logits = tf.layers.dense(logits_input, 2,
+                                        kernel_initializer=layers.xavier_initializer(),
+                                        kernel_regularizer=self.regularizer,
+                                        use_bias=True,
+                                        activation=None)
+        self.preds = tf.argmax(binary_logits, axis=1, output_type=tf.int32)
+        correct_pred = tf.equal(self.preds, self.answerable)
+        self.acc = tf.reduce_mean(tf.cast(correct_pred, dtype=tf.float32))
+        logistic_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=binary_logits,
+                                                                       labels=self.answerable)
+        logistic_loss = tf.reduce_mean(logistic_loss)
+
+        return attention_loss, logistic_loss
+
     def add_train_op(self):
         with tf.device("device:GPU:1"):
             lr = tf.minimum(self.config.lr,
@@ -541,6 +544,7 @@ class SSQANet(object):
         self.sess = tf.Session(config=config)
         self.sess.run(tf.global_variables_initializer())
         self.saver = tf.train.Saver()
+        self.summary_writer = tf.summary.FileWriter("./results/train", self.sess.graph)
 
     def save_session(self, path):
         if not os.path.exists(path):
@@ -565,8 +569,9 @@ class SSQANet(object):
             self.answer_span: spans,
             self.dropout: dropout
         }
-        output_feed = [self.train_op, self.loss, self.acc, self.preds, self.global_step]
-        _, loss, acc, pred, step = self.sess.run(output_feed, feed_dict)
+        output_feed = [self.train_op, self.loss, self.acc, self.preds, self.global_step, self.merged]
+        _, loss, acc, pred, step, summary = self.sess.run(output_feed, feed_dict)
+        self.summary_writer.add_summary(summary, step)
         return loss, acc, pred, step
 
     def eval(self, questions, question_length, contexts,
