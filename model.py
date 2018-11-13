@@ -55,23 +55,29 @@ class SSQANet(object):
                                             num_conv_blocks=4, kernel_size=7, num_filters=128,
                                             scope="Embedding_Encoder", reuse=True)
 
-        with tf.variable_scope("hierarchical_attention"):
+        with tf.variable_scope("hierarchical_attention") and tf.device("/device:GPU:0"):
             # [b * s, w, d]
             reshaped_sentences = tf.reshape(self.embedded_sentences,
                                             [-1, self.word_size, self.config.embedding_size])
-            sentence_lengths = tf.reshape(self.sequence_lengths, [-1])
-            sentence_lstm = self.bi_lstm_embedding(reshaped_sentences, sentence_lengths,
-                                                   scope="word_encoder", reuse=False)
+            cnn_inputs = tf.layers.dense(reshaped_sentences, self.config.attention_size,
+                                         kernel_regularizer=self.regularizer,
+                                         kernel_initializer=layers.xavier_initializer(),
+                                         activation=tf.nn.relu)
+            sentence_cnn = self.conv_encoder(cnn_inputs, self.config.attention_size,
+                                             scope="word_encoder", reuse=False)
             encoded_question = self.question_encoding(questions, self.question_legnths)
-            sentence_vectors = self.word_level_attention(encoded_question, sentence_lstm, self.document_size,
+            # [b, s, d]
+            sentence_vectors = self.word_level_attention(encoded_question, sentence_cnn, self.document_size,
                                                          self.sentence_size, self.word_size, self.sequence_lengths)
-            document_vector, sentence_score = self.sentence_level_attention(encoded_question, sentence_vectors,
+            sentence_cnn = self.conv_encoder(sentence_vectors, self.config.attention_size,
+                                             scope="sentence_encoder", reuse=False)
+            document_vector, sentence_score = self.sentence_level_attention(encoded_question, sentence_cnn,
                                                                             self.sentence_size, self.sentence_lengths)
 
             self.attention_loss, self.binary_loss = self.auxiliary_loss(sentence_score,
                                                                         document_vector,
                                                                         encoded_question)
-        with tf.variable_scope("Context_Query_Attention_Layer"):
+        with tf.variable_scope("Context_Query_Attention_Layer") and tf.device("/device:GPU:0"):
             A, B = self.co_attention(questions, contexts,
                                      self.question_legnths, self.context_legnths)
             attention_outputs = [contexts, A, contexts * A, contexts * B]
@@ -93,7 +99,7 @@ class SSQANet(object):
                 memories.append(outputs)
                 inputs = outputs
 
-        with tf.variable_scope("Output_Layer"):
+        with tf.variable_scope("Output_Layer") and tf.device("/device:GPU:0"):
             logits_inputs = tf.concat([memories[0], memories[1]], axis=2)
             start_logits = self.pointer_network(document_vector, logits_inputs,
                                                 self.context_legnths, scope="start_logits")
@@ -231,12 +237,12 @@ class SSQANet(object):
                     num_filters, scope, reuse, sublayers=(1, 1)):
         with tf.variable_scope(scope, reuse=reuse):
             l, L = sublayers
-            outputs = None
+            outputs = inputs
 
             for i in range(num_conv_blocks):
-                residual = inputs
+                residual = outputs
                 # apply layer normalization
-                normalized = layers.layer_norm(inputs)
+                normalized = layers.layer_norm(outputs)
                 if i % 2 == 0:
                     # apply dropout
                     normalized = tf.layers.dropout(normalized, self.dropout)
@@ -245,7 +251,7 @@ class SSQANet(object):
                 outputs = self.layer_dropout(outputs, residual, self.dropout * float(l) / L)
             return outputs, l
 
-    def depthwise_separable_conv(self, inputs, kernel_size, num_filters, scope, reuse):
+    def depthwise_separable_conv(self, inputs, kernel_size, num_filters, scope, reuse, rate=(1, 1)):
         with tf.variable_scope(scope, reuse=reuse):
             # [batch, t, 1, d]
             inputs = tf.expand_dims(inputs, axis=2)
@@ -263,10 +269,26 @@ class SSQANet(object):
                                    regularizer=self.regularizer)
 
             outputs = tf.nn.separable_conv2d(inputs, depthwise_filter, pointwise_filter,
-                                             strides=(1, 1, 1, 1), padding="SAME")
+                                             rate=rate, strides=(1, 1, 1, 1), padding="SAME")
             outputs = tf.nn.relu(outputs + bias)
             # recover to the original shape [b, t, d]
             outputs = tf.squeeze(outputs, axis=2)
+            return outputs
+
+    def conv_encoder(self, inputs, num_filters, scope, reuse):
+        outputs = inputs
+        with tf.variable_scope(scope, reuse=reuse):
+            rates = [(1, 1), (2, 2), (4, 4)]
+            for i, rate in enumerate(rates):
+                residual = outputs
+                outputs = self.depthwise_separable_conv(outputs, 5, num_filters,
+                                                        scope="conv_encoder_{}".format(i),
+                                                        reuse=False, rate=rate)
+                outputs = layers.layer_norm(outputs)
+                if i % 2 == 0:
+                    outputs = tf.layers.dropout(outputs, self.dropout)
+                outputs = self.layer_dropout(outputs, residual,
+                                             self.dropout * float(i) * float(len(rates)))
             return outputs
 
     def self_attention_block(self, inputs, sequence_length, sublayers, scope, reuse):
@@ -365,7 +387,6 @@ class SSQANet(object):
         # S : [b, n, m]
         n = tf.shape(contexts)[1]
         m = tf.shape(questions)[1]
-        # attention_score = self.quadlinear_attention(questions, contexts, document_vector)
         attention_score = self.trilinear_attention(questions, contexts)
         S = attention_score
         # key masking : [b, m]
@@ -417,7 +438,7 @@ class SSQANet(object):
     def word_level_attention(self, question_lstm, sentence_lstm, document_size,
                              sentence_size, word_size, sequence_lengths):
         # attend each sentence given the question
-        # [b, 1, d * 2 ] -> [b * s, w, d * 2]
+        # [b, 1, d] -> [b * s, w, d]
         with tf.variable_scope("word_attention"):
             query = tf.tile(tf.expand_dims(question_lstm, axis=1),
                             [sentence_size, word_size, 1])
@@ -451,7 +472,7 @@ class SSQANet(object):
             sentence_vector = tf.reduce_sum(sentence_lstm * attention_weight, axis=1)
             sentence_vectors = tf.reshape(sentence_vector,
                                           [document_size, sentence_size,
-                                           self.config.lstm_size * 2])
+                                           self.config.attention_size])
             return sentence_vectors
 
     def auxiliary_loss(self, attention_score, document_vector, question_vector):
@@ -476,27 +497,21 @@ class SSQANet(object):
         return attention_loss, logistic_loss
 
     def sentence_level_attention(self, question_vector, sentence_vectors, sentence_size, sentence_lengths):
-        with tf.variable_scope("sentence_attention") as scope:
-            query = tf.tile(tf.expand_dims(question_vector, 1), [1, self.sentence_size, 1])
-            # [b, s, 2 * d]
-            document_lstm = self.bi_lstm_embedding(sentence_vectors,
-                                                   sentence_lengths,
-                                                   scope, reuse=False)
-            attention_input = tf.concat([query, document_lstm], axis=2)
+        with tf.variable_scope("sentence_attention"):
+            # [b, d] -> [b, s, d]
+            query = tf.tile(tf.expand_dims(question_vector, 1), [1, sentence_size, 1])
+            attention_input = tf.concat([query, sentence_vectors], axis=2)
             projected = tf.layers.dense(attention_input,
                                         self.config.attention_size,
                                         kernel_initializer=layers.xavier_initializer(),
                                         kernel_regularizer=self.regularizer,
                                         activation=tf.nn.elu)
             projected = tf.layers.dropout(projected, self.dropout)
-            # [b ,s, d] -> [b * s, d]
-            reshaped_projected = tf.reshape(projected, [-1, self.config.attention_size])
-            v = tf.get_variable(shape=[self.config.attention_size, 1], name="v",
-                                initializer=layers.xavier_initializer(),
-                                regularizer=self.regularizer)
-            attention_score = tf.matmul(reshaped_projected, v)
             # [b * s, 1] -> [b, s, 1]
-            attention_score = tf.reshape(attention_score, [-1, sentence_size, 1])
+            attention_score = tf.layers.dense(projected, 1, use_bias=False,
+                                              kernel_initializer=layers.xavier_initializer(),
+                                              kernel_regularizer=self.regularizer,
+                                              activation=None)
 
             # -inf score for zero padding
             mask = tf.sequence_mask(sentence_lengths, dtype=tf.float32)
@@ -505,11 +520,11 @@ class SSQANet(object):
             attention_score = tf.where(tf.equal(mask, 0), padding, attention_score)
 
             attention_weight = tf.nn.softmax(attention_score, 1)
-            document_vector = tf.reduce_sum(document_lstm * attention_weight, axis=1)
+            document_vector = tf.reduce_sum(sentence_vectors * attention_weight, axis=1)
             return document_vector, attention_score
 
     def add_train_op(self):
-        with tf.variable_scope("adam_opt"):
+        with tf.device("device:GPU:1"):
             lr = tf.minimum(self.config.lr,
                             0.001 / tf.log(999.) * tf.log(tf.cast(self.global_step, tf.float32) + 1))
             opt = tf.train.AdamOptimizer(learning_rate=lr, beta1=0.8, beta2=0.999, epsilon=1e-7)

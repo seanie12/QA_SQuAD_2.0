@@ -7,6 +7,7 @@ class Config(object):
         self.vocab_file = "data/vocab"
         self.train_file = "data/train.txt"
         self.dev_file = "data/dev.txt"
+        self.dict_file = "data/dict.p"
         self.max_vocab_size = 5e4
         self.debug = True
         self.num_epochs = 20
@@ -23,7 +24,7 @@ class Config(object):
         self.beta = 1e-1
         self.l2_lambda = 3e-7
         self.num_heads = 8
-        self.ans_limit = 30
+        self.ans_limit = 20
         self.embeddings = load_glove("data/glove.npz")
         self.dir_output = "results/save/"
         self.dir_model = self.dir_output + "model.weights/"

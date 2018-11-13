@@ -6,7 +6,7 @@ import numpy as np
 
 def main():
     config = Config()
-    vocab = Vocab(config.train_file, config.vocab_file, config.max_vocab_size, load=True)
+    vocab = Vocab(config.dict_file)
     q, c, s, spans, s_idx, answerable = load_data(config.train_file, vocab, config.debug)
     dev_q, dev_c, dev_s, dev_spans, dev_s_idx, dev_answerable = load_data(config.dev_file, vocab, config.debug)
     train_data = list(zip(q, c, s, s_idx, answerable, spans))
@@ -16,7 +16,7 @@ def main():
     best_score = 0
     for i in range(config.num_epochs):
         epoch = i + 1
-        batches = batch_loader(train_data, config.batch_size, shuffle=True)
+        batches = batch_loader(train_data, config.batch_size, shuffle=False)
         for batch in batches:
             batch_q, batch_c, batch_s, batch_s_idx, batch_ans, batch_spans = zip(*batch)
             question_lengths, padded_q = zero_padding(batch_q, level=1)
@@ -24,12 +24,13 @@ def main():
             sequence_lengths, sentence_lengths, padded_s = zero_padding(batch_s, level=2)
             loss, acc, pred, step = ssnet.train(padded_q, question_lengths, padded_c, context_lengths,
                                                 padded_s, sequence_lengths, sentence_lengths,
-                                                batch_s_idx, batch_ans, batch_spans, 0.5)
+                                                batch_s_idx, batch_ans, batch_spans, config.dropout)
             batch_acc, batch_em = ssnet.eval(padded_q, question_lengths, padded_c, context_lengths,
                                              padded_s, sequence_lengths, sentence_lengths,
                                              batch_ans, batch_spans)
-            print("epoch: %d, step:%d, loss:%.4f, acc:%.2f, em:%.2f"
-                  % (epoch, step, loss, batch_acc, batch_em))
+            if step % 10 == 0:
+                print("epoch: %d, step:%d, loss:%.4f, acc:%.2f, em:%.2f"
+                      % (epoch, step, loss, batch_acc, batch_em))
 
         dev_batches = batch_loader(dev_data, config.batch_size, shuffle=False)
         total_em = []
