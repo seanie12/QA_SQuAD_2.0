@@ -4,7 +4,7 @@ import math
 import os
 
 
-# TODO: GloVE, ELMO embedding
+# TODO: ELMO embedding
 class SSQANet(object):
     def __init__(self, config):
         self.config = config
@@ -17,22 +17,28 @@ class SSQANet(object):
 
     def build_model(self):
         # add place holder
-        self.contexts = tf.placeholder(shape=[None, None], dtype=tf.int32)
-        self.context_legnths = tf.placeholder(shape=[None], dtype=tf.int32)
-        self.questions = tf.placeholder(shape=[None, None], dtype=tf.int32)
-        self.question_legnths = tf.placeholder(shape=[None], dtype=tf.int32)
-        # [batch, num_words]
-        self.input_words = tf.placeholder(shape=[None, None], dtype=tf.int32)
+        self.contexts = tf.placeholder(shape=[None, None], dtype=tf.int32, name="context")
+        self.context_legnths = tf.placeholder(shape=[None], dtype=tf.int32, name="c_length")
+        self.questions = tf.placeholder(shape=[None, None], dtype=tf.int32, name="q")
+        self.question_legnths = tf.placeholder(shape=[None], dtype=tf.int32, name="q_len")
         # [batch, num_sentences, num_words]
-        self.sentences = tf.placeholder(shape=[None, None, None], dtype=tf.int32)
+        self.sentences = tf.placeholder(shape=[None, None, None], dtype=tf.int32, name="sentences")
         # [num_sentences, num_words]
-        self.sequence_lengths = tf.placeholder(shape=[None, None], dtype=tf.int32)
+        self.sequence_lengths = tf.placeholder(shape=[None, None], dtype=tf.int32, name="seq_len")
         # [num_sentences]
-        self.sentence_lengths = tf.placeholder(shape=[None], dtype=tf.int32)
-        self.sentence_idx = tf.placeholder(shape=[None], dtype=tf.int32)
-        self.answerable = tf.placeholder(shape=[None], dtype=tf.int32)
-        self.answer_span = tf.placeholder(shape=[None, 2], dtype=tf.int32)
+        self.sentence_lengths = tf.placeholder(shape=[None], dtype=tf.int32, name="sent_len")
+        self.sentence_idx = tf.placeholder(shape=[None], dtype=tf.int32, name="sent_idx")
+        self.answerable = tf.placeholder(shape=[None], dtype=tf.int32, name="answ")
+        self.answer_span = tf.placeholder(shape=[None, 2], dtype=tf.int32, name="answer_span")
         self.dropout = tf.placeholder(dtype=tf.float32, name="dropout")
+
+        self.avg_loss = tf.placeholder(dtype=tf.float32, name="avg_loss")
+        self.avg_em = tf.placeholder(dtype=tf.float32, name="avg_em")
+        self.avg_acc = tf.placeholder(dtype=tf.float32, name="avg_acc")
+        loss_summary = tf.summary.scalar("loss", self.avg_em)
+        acc_summary = tf.summary.scalar("accuracy", self.avg_acc)
+        em_summary = tf.summary.scalar("em", self.avg_em)
+        self.merged = tf.summary.merge([loss_summary, acc_summary, em_summary])
 
         self.document_size, self.sentence_size, self.word_size = tf.unstack(tf.shape(self.sentences))
         # add embeddings
@@ -43,11 +49,12 @@ class SSQANet(object):
         embedding_matrix = tf.Variable(initial_value=self.config.embeddings, trainable=False,
                                        dtype=tf.float32, name="embedding")
         self.embedding_matrix = tf.concat([zeros, unk_dummy, embedding_matrix], axis=0)
-        self.embedded_words = tf.nn.embedding_lookup(self.embedding_matrix, self.input_words)
         self.embedded_sentences = tf.nn.embedding_lookup(self.embedding_matrix, self.sentences)
+        self.embedded_sentences = tf.layers.dropout(self.embedded_sentences, self.dropout)
         self.embedded_context = tf.nn.embedding_lookup(self.embedding_matrix, self.contexts)
+        self.embedded_context = tf.layers.dropout(self.embedded_context, self.dropout)
         self.embedded_questions = tf.nn.embedding_lookup(self.embedding_matrix, self.questions)
-
+        self.embedded_questions = tf.layers.dropout(self.embedded_questions, self.dropout)
         # conv block and self attention block
         with tf.variable_scope("Embedding_Encoder_Layer"):
             contexts = self.residual_block(self.embedded_context, self.context_legnths,
@@ -56,12 +63,16 @@ class SSQANet(object):
             questions = self.residual_block(self.embedded_questions, self.question_legnths, num_blocks=1,
                                             num_conv_blocks=4, kernel_size=7, num_filters=128,
                                             scope="Embedding_Encoder", reuse=True)
+            reshaped_sentences = tf.reshape(self.embedded_sentences,
+                                            [-1, self.word_size, self.config.embedding_size])
+            sentence_len = tf.reshape(self.sequence_lengths, [-1])
+            encoded_sentence = self.residual_block(reshaped_sentences, sentence_len, num_blocks=1,
+                                                   num_conv_blocks=1, kernel_size=7,
+                                                   num_filters=128, scope="Embedding_Encoder", reuse=True)
 
         with tf.variable_scope("hierarchical_attention") and tf.device("/device:GPU:0"):
             # [b * s, w, d]
-            reshaped_sentences = tf.reshape(self.embedded_sentences,
-                                            [-1, self.word_size, self.config.embedding_size])
-            cnn_inputs = tf.layers.dense(reshaped_sentences, self.config.filter_size,
+            cnn_inputs = tf.layers.dense(encoded_sentence, self.config.filter_size,
                                          kernel_regularizer=self.regularizer,
                                          kernel_initializer=layers.xavier_initializer(),
                                          activation=tf.nn.relu)
@@ -118,7 +129,6 @@ class SSQANet(object):
             self.loss = cross_entropy_loss \
                         + self.config.alpha * self.attention_loss \
                         + self.config.beta * self.binary_loss
-            tf.summary.scalar("loss", self.loss)
 
         # for inference
         logits1 = tf.nn.softmax(start_logits)
@@ -127,9 +137,7 @@ class SSQANet(object):
         outer = tf.matrix_band_part(outer_product, 0, self.config.ans_limit)
         self.start = tf.argmax(tf.reduce_max(outer, axis=2), axis=1, output_type=tf.int32)
         self.end = tf.argmax(tf.reduce_max(outer, axis=1), axis=1, output_type=tf.int32)
-        self.em = self.evaluate_em(self.start, self.end, self.answer_span)
-        tf.summary.scalar("EM", self.em)
-        self.merged = tf.summary.merge_all()
+        self.em = self.evaluate_em(self.start, self.end, self.answer_span, self.unans_prob)
         if self.config.l2_lambda > 0:
             vars = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
             l2_loss = layers.apply_regularization(self.regularizer, vars)
@@ -149,11 +157,14 @@ class SSQANet(object):
         self.add_train_op()
         self.init_session()
 
-    @staticmethod
-    def evaluate_em(start_preds, end_preds, answer_spans):
+    def evaluate_em(self, start_preds, end_preds, answer_spans, unans_probs, threshold=0.5):
+        # if the question is unanswerable, answer span should be last token idx
+        dummy_idx = self.context_legnths - 1
+        start_preds = tf.where(tf.greater_equal(unans_probs, threshold), dummy_idx, start_preds)
+        end_preds = tf.where(tf.greater_equal(unans_probs, threshold), dummy_idx, end_preds)
         ans_start, ans_end = tf.split(answer_spans, 2, axis=1)
-        ans_start = tf.squeeze(ans_start, axis=1)
-        ans_end = tf.squeeze(ans_end, axis=1)
+        ans_start = tf.squeeze(ans_start, axis=-1)
+        ans_end = tf.squeeze(ans_end, axis=-1)
         correct_start = tf.equal(start_preds, ans_start)
         correct_end = tf.equal(end_preds, ans_end)
         total_correct = tf.cast(tf.logical_and(correct_start, correct_end), dtype=tf.float32)
@@ -426,21 +437,6 @@ class SSQANet(object):
 
         return A, B
 
-    def bi_lstm_embedding(self, inputs, sequence_length, scope, reuse, return_last=False):
-        with tf.variable_scope(scope, reuse=reuse):
-            cell_fw = tf.nn.rnn_cell.LSTMCell(self.config.lstm_size)
-            cell_bw = tf.nn.rnn_cell.LSTMCell(self.config.lstm_size)
-            outputs, (fw_states, bw_states) = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw,
-                                                                              inputs, sequence_length,
-                                                                              dtype=tf.float32)
-            outputs = tf.concat(outputs, axis=-1)
-            outputs = tf.layers.dropout(outputs, self.dropout)
-            last_states = tf.concat([fw_states[-1], bw_states[-1]], axis=1)
-            if return_last:
-                return last_states
-            else:
-                return outputs
-
     def word_level_attention(self, question_lstm, sentence_lstm, document_size,
                              sentence_size, word_size, sequence_lengths):
         # attend each sentence given the question
@@ -517,6 +513,7 @@ class SSQANet(object):
                                         kernel_regularizer=self.regularizer,
                                         use_bias=True,
                                         activation=None)
+        self.unans_prob = binary_logits[:, 0]
         self.preds = tf.argmax(binary_logits, axis=1, output_type=tf.int32)
         correct_pred = tf.equal(self.preds, self.answerable)
         self.acc = tf.reduce_mean(tf.cast(correct_pred, dtype=tf.float32))
@@ -544,7 +541,8 @@ class SSQANet(object):
         self.sess = tf.Session(config=config)
         self.sess.run(tf.global_variables_initializer())
         self.saver = tf.train.Saver()
-        self.summary_writer = tf.summary.FileWriter("./results/train", self.sess.graph)
+        self.train_writer = tf.summary.FileWriter("./results/train", self.sess.graph)
+        self.dev_writer = tf.summary.FileWriter("./results/dev", self.sess.graph)
 
     def save_session(self, path):
         if not os.path.exists(path):
@@ -569,13 +567,13 @@ class SSQANet(object):
             self.answer_span: spans,
             self.dropout: dropout
         }
-        output_feed = [self.train_op, self.loss, self.acc, self.preds, self.global_step, self.merged]
-        _, loss, acc, pred, step, summary = self.sess.run(output_feed, feed_dict)
-        self.summary_writer.add_summary(summary, step)
+        output_feed = [self.train_op, self.loss, self.acc, self.preds, self.global_step]
+        _, loss, acc, pred, step = self.sess.run(output_feed, feed_dict)
         return loss, acc, pred, step
 
     def eval(self, questions, question_length, contexts,
-             context_lengths, sentences, sequence_lengths, sentence_lengths, answerable, span):
+             context_lengths, sentences, sequence_lengths,
+             sentence_lengths, sentence_idx, answerable, span):
         feed_dict = {
             self.questions: questions,
             self.question_legnths: question_length,
@@ -584,13 +582,26 @@ class SSQANet(object):
             self.sentences: sentences,
             self.sequence_lengths: sequence_lengths,
             self.sentence_lengths: sentence_lengths,
+            self.sentence_idx:sentence_idx,
             self.answerable: answerable,
             self.answer_span: span,
             self.dropout: 0.0
         }
-        output_feed = [self.acc, self.em]
-        acc, em = self.sess.run(output_feed, feed_dict)
-        return acc, em
+        output_feed = [self.acc, self.em, self.loss]
+        acc, em, loss = self.sess.run(output_feed, feed_dict)
+        return acc, em, loss
+
+    def write_summary(self, avg_acc, avg_em, avg_loss, mode):
+        feed_dict = {
+            self.avg_acc: avg_acc,
+            self.avg_em: avg_em,
+            self.avg_loss: avg_loss
+        }
+        summary, step = self.sess.run([self.merged, self.global_step], feed_dict)
+        if mode == "train":
+            self.train_writer.add_summary(summary, step)
+        else:
+            self.dev_writer.add_summary(summary, step)
 
     def infer(self, questions, question_length, contexts,
               context_lengths, sentences, sequence_lengths, sentence_lengths):

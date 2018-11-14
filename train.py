@@ -25,35 +25,45 @@ def main():
             loss, acc, pred, step = ssnet.train(padded_q, question_lengths, padded_c, context_lengths,
                                                 padded_s, sequence_lengths, sentence_lengths,
                                                 batch_s_idx, batch_ans, batch_spans, config.dropout)
-            batch_acc, batch_em = ssnet.eval(padded_q, question_lengths, padded_c, context_lengths,
-                                             padded_s, sequence_lengths, sentence_lengths,
-                                             batch_ans, batch_spans)
-            if step % 10 == 0:
+            train_batch_acc, train_batch_em, train_batch_loss = ssnet.eval(padded_q, question_lengths, padded_c,
+                                                                           context_lengths,
+                                                                           padded_s, sequence_lengths,
+                                                                           sentence_lengths, batch_s_idx,
+                                                                           batch_ans, batch_spans)
+            if step % 100 == 0:
                 print("epoch: %d, step:%d, loss:%.4f, acc:%.2f, em:%.2f"
-                      % (epoch, step, loss, batch_acc, batch_em))
+                      % (epoch, step, loss, train_batch_acc, train_batch_em))
 
-        dev_batches = batch_loader(dev_data, config.batch_size, shuffle=False)
-        total_em = []
-        total_acc = []
-        for dev_batch in dev_batches:
-            dev_batch_q, dev_batch_c, dev_batch_s, \
-            dev_batch_s_idx, dev_batch_ans, dev_batch_spans = zip(*dev_batch)
-            question_lengths, padded_q = zero_padding(dev_batch_q, level=1)
-            context_lengths, padded_c = zero_padding(dev_batch_c, level=1)
-            sequence_lengths, sentence_lengths, padded_s = zero_padding(dev_batch_s, level=2)
-            batch_acc, batch_em = ssnet.eval(padded_q, question_lengths, padded_c, context_lengths,
-                                             padded_s, sequence_lengths, sentence_lengths,
-                                             dev_batch_ans, dev_batch_spans)
+            if step % 1000 == 0:
+                dev_batches = batch_loader(dev_data, config.batch_size, shuffle=False)
+                total_em = []
+                total_acc = []
+                total_loss = []
+                for dev_batch in dev_batches:
+                    dev_batch_q, dev_batch_c, dev_batch_s, \
+                    dev_batch_s_idx, dev_batch_ans, dev_batch_spans = zip(*dev_batch)
+                    question_lengths, padded_q = zero_padding(dev_batch_q, level=1)
+                    context_lengths, padded_c = zero_padding(dev_batch_c, level=1)
+                    sequence_lengths, sentence_lengths, padded_s = zero_padding(dev_batch_s, level=2)
+                    dev_batch_acc, dev_batch_em, dev_batch_loss = ssnet.eval(padded_q, question_lengths, padded_c,
+                                                                             context_lengths,
+                                                                             padded_s, sequence_lengths,
+                                                                             sentence_lengths, dev_batch_s_idx,
+                                                                             dev_batch_ans, dev_batch_spans)
 
-            total_em.append(batch_em)
-            total_acc.append(batch_acc)
-        dev_em = np.mean(total_em)
-        dev_acc = np.mean(total_acc)
-
-        if dev_em > best_score:
-            best_score = dev_em
-            print("new score! em: %.2f, acc:%.2f" % (dev_em, dev_acc))
-            ssnet.save_session(config.dir_model)
+                    total_loss.append(dev_batch_loss)
+                    total_em.append(dev_batch_em)
+                    total_acc.append(dev_batch_acc)
+                dev_em = np.mean(total_em)
+                dev_acc = np.mean(total_acc)
+                dev_loss = np.mean(total_loss)
+                ssnet.write_summary(dev_acc, dev_em, dev_loss, mode="dev")
+                ssnet.write_summary(train_batch_acc, train_batch_em, train_batch_loss, mode="train")
+                print("after %d step, dev_em:%.2f" % (step, dev_em))
+                if dev_em > best_score:
+                    best_score = dev_em
+                    print("new score! em: %.2f, acc:%.2f" % (dev_em, dev_acc))
+                    ssnet.save_session(config.dir_model)
 
 
 if __name__ == "__main__":
